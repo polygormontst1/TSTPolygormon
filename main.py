@@ -15,8 +15,8 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# FINÁLNÍ A NEJSPOLEHLIVĚJŠÍ KUCOIN ENDPOINT: Level 1 Orderbook pro jeden symbol.
-BINANCE_PRICE_URL = "https://api.kucoin.com/api/v1/market/orderbook/level1"
+# POSLEDNÍ POKUS: Návrat k Binance Ticker. Očekáváme Chybu 451, ale zkusíme to.
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -125,33 +125,29 @@ async def post(bot: Bot, text: str):
     except TelegramError as e:
         log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
-# NOVÁ A FINÁLNÍ FUNKCE PRO ZÍSKÁNÍ CENY Z KUCOINU (ORDERBOOK LEVEL 1)
+# OPRAVENÁ get_price_sync PRO BINANCE PUBLIC TICKER
 def get_price_sync(symbol: str):
-    # Převod symbolu na KuCoin formát (např. BTCUSDT -> BTC-USDT)
-    kucoin_symbol = symbol.replace('USDT', '-USDT') 
-
-    # Voláme Level 1 Orderbook pro jeden symbol
-    r = requests.get(BINANCE_PRICE_URL, params={"symbol": kucoin_symbol}, timeout=8) 
+    # Voláme Binance API s parametrem symbolu (BTCUSDT)
+    r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=8) 
     r.raise_for_status()
     
     data = r.json()
     
-    # Zpracování dat pro KuCoin Level 1 Orderbook
-    if data.get('code') == '2000000':
-        # Cena je v 'data' pod klíčem 'price'
-        if 'data' in data and 'price' in data['data']:
-            return float(data['data']['price'])
-        
-        log(f"KuCoin: Price not found in response for {kucoin_symbol}.")
-        return None
-    else:
-        # Chyba z KuCoin API (např. servisní problém)
-        log(f"KuCoin API error for {kucoin_symbol}: {data.get('msg', 'Unknown error')}")
-        return None
+    # Binance Ticker vrací cenu pod klíčem 'price'
+    if 'price' in data:
+        return float(data['price'])
+    
+    # Zde se objeví log v případě jiného než očekávaného JSONu
+    log(f"Binance API: Price not found in response for {symbol}. Raw response: {data}")
+    return None
 
 async def get_price(symbol: str):
     try:
         return await asyncio.to_thread(get_price_sync, symbol)
+    except requests.exceptions.HTTPError as e:
+        # TADY SE UKÁŽE, JESTLI JE TO ZASE CHYBA 451
+        log(f"get_price({symbol}) HTTPError: {e.response.status_code} - {e}")
+        return None
     except Exception as e:
         log(f"get_price({symbol}) error: {e}")
         return None
@@ -200,14 +196,13 @@ async def monitor_prices(bot: Bot, conn):
     log("monitor_prices() started")
     while True:
         try:
-            # Opravený SQL dotaz: Načítáme Entry 1 i Entry 2
+            # Načítáme Entry 1 i Entry 2
             rows = conn.execute(
                 "SELECT id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, activated, tp_hits FROM signals"
             ).fetchall()
 
             log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
-            # Přizpůsobený cyklus pro čtení E2
             for sid, symbol, side, e1l, e1h, e2l, e2h, tps_json, activated, tp_hits in rows:
                 price = await get_price(symbol)
                 log(f"check sid={sid} {symbol} {side} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits}")
@@ -219,7 +214,7 @@ async def monitor_prices(bot: Bot, conn):
                 e_ref = entry_ref(e1l, e1h)
 
                 if not activated:
-                    # NOVÁ LOGIKA AKTIVACE: Kontrola Entry 1 NEBO Entry 2
+                    # Kontrola Entry 1 NEBO Entry 2
                     is_activated = False
                     
                     # 1. Kontrola Entry 1
