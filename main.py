@@ -10,20 +10,17 @@ BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"].strip())
 
-# ZPĚT K COINGECKU A BEZPEČNÝ INTERVAL 60 SEKUND
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60")) 
+# ZDE VLOŽTE URL VAŠEHO CLOUDFLARE WORKERU!
+# MĚLO BY TO BÝT TO, CO JSTE ZKOPÍROVAL/A V KROKU 2!
+PROXY_PRICE_URL = "https://VASE-URL-WORKERU.workers.dev" 
+
+# Můžeme se vrátit k rychlejšímu intervalu (15s), protože proxy by měla být stabilní
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "15")) 
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
-ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
+ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# FINÁLNÍ ZDROJ: CoinGecko Simple Price API (Agregátor, řešíme 429)
-COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
-
-# GLOBÁLNÍ CACHE PRO ULOŽENÍ POSLEDNÍ CENY A ČASU ZÍSKÁNÍ
-# Klíč: symbol (BTCUSDT), Hodnota: (cena, čas_získání_ts)
-PRICE_CACHE = {}
-CACHE_TTL = 10 # Sekund: Cenu BTCUSDT nebudeme zjišťovat častěji než každých 10 sekund
-
+# REGEX A DB FUNKCE (ZŮSTÁVAJÍ STEJNÉ)
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -33,7 +30,6 @@ def connect_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,49 +127,33 @@ async def post(bot: Bot, text: str):
     except TelegramError as e:
         log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
-# NOVÁ get_price_sync PRO COINGECKO S CACHINGEM
+# get_price_sync VOLÁ VÁŠ CLOUDFLARE WORKER
 def get_price_sync(symbol: str):
     
-    # 1. KONTROLA CACHE
-    if symbol in PRICE_CACHE:
-        price, timestamp = PRICE_CACHE[symbol]
-        # Pokud je cena v cache čerstvá (mladší než CACHE_TTL), vrátíme ji
-        if time.time() - timestamp < CACHE_TTL:
-            log(f"Cache hit for {symbol}: {price}")
-            return price
-    
-    # Podporujeme pouze BTCUSDT
-    coin_id = "bitcoin" if symbol == "BTCUSDT" else None
-    vs_currency = "usd"
-
-    if coin_id is None:
-        log(f"CoinGecko: Nepodporovaný symbol {symbol} pro CoinGecko API.")
-        return None
-
     try:
         r = requests.get(
-            COINGECKO_PRICE_URL, 
-            params={"ids": coin_id, "vs_currencies": vs_currency}, 
+            PROXY_PRICE_URL, 
+            params={"symbol": symbol}, 
             timeout=8
         ) 
         r.raise_for_status()
         
         data = r.json()
         
-        if coin_id in data and vs_currency in data[coin_id]:
-            price = float(data[coin_id][vs_currency])
-            
-            # 2. ULOŽENÍ DO CACHE PŘI ÚSPĚCHU
-            PRICE_CACHE[symbol] = (price, time.time())
+        # Očekáváme jednoduchý JSON z Workeru: {"price": XXXXX}
+        if 'price' in data:
+            price = float(data['price'])
             return price
         
-        log(f"CoinGecko API: Price not found in response for {symbol}. Raw response: {data}")
+        # Kontrola, zda Worker vrátil chybu
+        if 'error' in data:
+            log(f"Proxy Worker error for {symbol}: {data['error']}")
+            return None
+
+        log(f"Proxy API: Invalid response for {symbol}. Raw response: {data}")
         return None
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            log(f"get_price({symbol}) CoinGecko HTTPError: 429 RATE LIMIT. Pauza 60s se uplatní v dalším cyklu.")
-        else:
-            log(f"get_price({symbol}) CoinGecko HTTPError: {e.response.status_code} - {e}")
+        log(f"get_price({symbol}) Worker HTTPError: {e.response.status_code} - {e}")
         return None
     except Exception as e:
         log(f"get_price({symbol}) error: {e}")
@@ -187,8 +167,7 @@ def save_signal(conn, source_message_id, s):
         conn.execute(
             """INSERT INTO signals(source_message_id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, created_ts)
                VALUES(?,?,?,?,?,?,?,?,?)""",
-            (source_message_id, s["symbol"], s["side"], s["entry1_low"], s["entry1_high"],
-             s["entry2_low"], s["entry2_high"], json.dumps(s["tps"]), int(time.time()))
+            (source_message_id, s["symbol"], s["side"], s["entry1_low"], s["entry1_high"], s["entry2_low"], s["entry2_high"], json.dumps(s["tps"]), int(time.time()))
         )
         conn.commit()
         return True
@@ -226,7 +205,6 @@ async def monitor_prices(bot: Bot, conn):
     log("monitor_prices() started")
     while True:
         try:
-            # Načítáme Entry 1 i Entry 2
             rows = conn.execute(
                 "SELECT id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, activated, tp_hits FROM signals"
             ).fetchall()
@@ -244,14 +222,11 @@ async def monitor_prices(bot: Bot, conn):
                 e_ref = entry_ref(e1l, e1h)
 
                 if not activated:
-                    # Kontrola Entry 1 NEBO Entry 2
                     is_activated = False
                     
-                    # 1. Kontrola Entry 1
                     if e1l <= price <= e1h:
                         is_activated = True
                     
-                    # 2. Kontrola Entry 2 (pouze pokud existuje a není již aktivováno v E1)
                     if not is_activated and e2l is not None and e2h is not None and e2l <= price <= e2h:
                         is_activated = True
                     
@@ -270,7 +245,6 @@ async def monitor_prices(bot: Bot, conn):
                         )
                     continue
 
-                # TP hits (až po aktivaci)
                 while tp_hits < len(tps):
                     tp = float(tps[tp_hits])
                     is_hit = (price >= tp) if side == "LONG" else (price <= tp)
@@ -299,7 +273,7 @@ async def main_async():
     conn = connect_db()
 
     # Startup message
-    await post(bot, "🤖 Bot běží.")
+    await post(bot, "🤖 Bot běží. Cena z Worker Proxy.")
 
     last_update_id = int(state_get(conn, "last_update_id", "0"))
 
