@@ -10,13 +10,19 @@ BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"].strip())
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "15"))
+# ZPĚT K COINGECKU A BEZPEČNÝ INTERVAL 60 SEKUND
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60")) 
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# FINÁLNÍ ZDROJ: CoinGecko Simple Price API (Agregátor, bez geoblokace)
+# FINÁLNÍ ZDROJ: CoinGecko Simple Price API (Agregátor, řešíme 429)
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+# GLOBÁLNÍ CACHE PRO ULOŽENÍ POSLEDNÍ CENY A ČASU ZÍSKÁNÍ
+# Klíč: symbol (BTCUSDT), Hodnota: (cena, čas_získání_ts)
+PRICE_CACHE = {}
+CACHE_TTL = 10 # Sekund: Cenu BTCUSDT nebudeme zjišťovat častěji než každých 10 sekund
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -125,12 +131,20 @@ async def post(bot: Bot, text: str):
     except TelegramError as e:
         log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
-# NOVÁ get_price_sync PRO COINGECKO
+# NOVÁ get_price_sync PRO COINGECKO S CACHINGEM
 def get_price_sync(symbol: str):
-    # CoinGecko používá zjednodušené ID a vs_currency. Předpokládáme BTC/USDT.
-    # Pro jednoduchost budeme zatím podporovat jen BTCUSDT. Pokud byste potřeboval/a jiné páry, bude třeba složitější mapování.
+    
+    # 1. KONTROLA CACHE
+    if symbol in PRICE_CACHE:
+        price, timestamp = PRICE_CACHE[symbol]
+        # Pokud je cena v cache čerstvá (mladší než CACHE_TTL), vrátíme ji
+        if time.time() - timestamp < CACHE_TTL:
+            log(f"Cache hit for {symbol}: {price}")
+            return price
+    
+    # Podporujeme pouze BTCUSDT
     coin_id = "bitcoin" if symbol == "BTCUSDT" else None
-    vs_currency = "usd" # CoinGecko používá "usd" jako protiměnu, což je ekvivalent USDT na burzách.
+    vs_currency = "usd"
 
     if coin_id is None:
         log(f"CoinGecko: Nepodporovaný symbol {symbol} pro CoinGecko API.")
@@ -146,14 +160,20 @@ def get_price_sync(symbol: str):
         
         data = r.json()
         
-        # CoinGecko vrací strukturu {'bitcoin': {'usd': XXXXX}}
         if coin_id in data and vs_currency in data[coin_id]:
-            return float(data[coin_id][vs_currency])
+            price = float(data[coin_id][vs_currency])
+            
+            # 2. ULOŽENÍ DO CACHE PŘI ÚSPĚCHU
+            PRICE_CACHE[symbol] = (price, time.time())
+            return price
         
         log(f"CoinGecko API: Price not found in response for {symbol}. Raw response: {data}")
         return None
     except requests.exceptions.HTTPError as e:
-        log(f"get_price({symbol}) CoinGecko HTTPError: {e.response.status_code} - {e}")
+        if e.response.status_code == 429:
+            log(f"get_price({symbol}) CoinGecko HTTPError: 429 RATE LIMIT. Pauza 60s se uplatní v dalším cyklu.")
+        else:
+            log(f"get_price({symbol}) CoinGecko HTTPError: {e.response.status_code} - {e}")
         return None
     except Exception as e:
         log(f"get_price({symbol}) error: {e}")
