@@ -15,9 +15,8 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# NOVÝ SPOT price endpoint pro KuCoin, který obejde geoblokaci Binance.
-# Vrací všechny tickery, což vyžaduje upravenou logiku get_price_sync.
-BINANCE_PRICE_URL = "https://api.kucoin.com/api/v1/market/allTickers"
+# FINÁLNÍ A NEJSPOLEHLIVĚJŠÍ KUCOIN ENDPOINT: Level 1 Orderbook pro jeden symbol.
+BINANCE_PRICE_URL = "https://api.kucoin.com/api/v1/market/orderbook/level1"
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -126,32 +125,28 @@ async def post(bot: Bot, text: str):
     except TelegramError as e:
         log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
-# NOVÁ A OPRAVENÁ FUNKCE PRO ZÍSKÁNÍ CENY Z KUCOINU
+# NOVÁ A FINÁLNÍ FUNKCE PRO ZÍSKÁNÍ CENY Z KUCOINU (ORDERBOOK LEVEL 1)
 def get_price_sync(symbol: str):
-    # Voláme KuCoin API pro všechny tickery (URL je už nastavená)
-    r = requests.get(BINANCE_PRICE_URL, timeout=8) 
+    # Převod symbolu na KuCoin formát (např. BTCUSDT -> BTC-USDT)
+    kucoin_symbol = symbol.replace('USDT', '-USDT') 
+
+    # Voláme Level 1 Orderbook pro jeden symbol
+    r = requests.get(BINANCE_PRICE_URL, params={"symbol": kucoin_symbol}, timeout=8) 
     r.raise_for_status()
     
     data = r.json()
     
-    # Zpracování dat pro KuCoin allTickers
+    # Zpracování dat pro KuCoin Level 1 Orderbook
     if data.get('code') == '2000000':
-        # 1. Převod symbolu na KuCoin formát (např. BTCUSDT -> BTC-USDT)
-        kucoin_symbol = symbol.replace('USDT', '-USDT') 
+        # Cena je v 'data' pod klíčem 'price'
+        if 'data' in data and 'price' in data['data']:
+            return float(data['data']['price'])
         
-        # 2. Hledání v seznamu tickerů
-        for ticker in data['data']['ticker']:
-            # Najít odpovídající symbol
-            if ticker.get('symbol') == kucoin_symbol: 
-                # KuCoin SPOT vrací cenu pod klíčem 'lastTradePrice'
-                return float(ticker['lastTradePrice'])
-        
-        # Logování, pokud symbol nebyl nalezen
-        log(f"KuCoin: Symbol {kucoin_symbol} not found in allTickers list.")
+        log(f"KuCoin: Price not found in response for {kucoin_symbol}.")
         return None
     else:
         # Chyba z KuCoin API (např. servisní problém)
-        log(f"KuCoin API error: {data.get('msg', 'Unknown error')}")
+        log(f"KuCoin API error for {kucoin_symbol}: {data.get('msg', 'Unknown error')}")
         return None
 
 async def get_price(symbol: str):
@@ -205,7 +200,7 @@ async def monitor_prices(bot: Bot, conn):
     log("monitor_prices() started")
     while True:
         try:
-            # Opravený SQL dotaz: Načítáme i Entry 2 (e2l, e2h)
+            # Opravený SQL dotaz: Načítáme Entry 1 i Entry 2
             rows = conn.execute(
                 "SELECT id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, activated, tp_hits FROM signals"
             ).fetchall()
@@ -224,14 +219,14 @@ async def monitor_prices(bot: Bot, conn):
                 e_ref = entry_ref(e1l, e1h)
 
                 if not activated:
-                    # NOVÁ LOGIKA AKTIVACE: Kontrola Entry 1 OR Entry 2
+                    # NOVÁ LOGIKA AKTIVACE: Kontrola Entry 1 NEBO Entry 2
                     is_activated = False
                     
                     # 1. Kontrola Entry 1
                     if e1l <= price <= e1h:
                         is_activated = True
                     
-                    # 2. Kontrola Entry 2 (pouze pokud existuje)
+                    # 2. Kontrola Entry 2 (pouze pokud existuje a není již aktivováno v E1)
                     if not is_activated and e2l is not None and e2h is not None and e2l <= price <= e2h:
                         is_activated = True
                     
@@ -278,7 +273,7 @@ async def main_async():
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    # Startup message (zatím jednoduchý – DB není persistentní)
+    # Startup message
     await post(bot, "🤖 Bot běží.")
 
     last_update_id = int(state_get(conn, "last_update_id", "0"))
