@@ -15,8 +15,8 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# POSLEDNÍ POKUS: Návrat k Binance Ticker. Očekáváme Chybu 451, ale zkusíme to.
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+# FINÁLNÍ ZDROJ: CoinGecko Simple Price API (Agregátor, bez geoblokace)
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -125,32 +125,42 @@ async def post(bot: Bot, text: str):
     except TelegramError as e:
         log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
-# OPRAVENÁ get_price_sync PRO BINANCE PUBLIC TICKER
+# NOVÁ get_price_sync PRO COINGECKO
 def get_price_sync(symbol: str):
-    # Voláme Binance API s parametrem symbolu (BTCUSDT)
-    r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=8) 
-    r.raise_for_status()
-    
-    data = r.json()
-    
-    # Binance Ticker vrací cenu pod klíčem 'price'
-    if 'price' in data:
-        return float(data['price'])
-    
-    # Zde se objeví log v případě jiného než očekávaného JSONu
-    log(f"Binance API: Price not found in response for {symbol}. Raw response: {data}")
-    return None
+    # CoinGecko používá zjednodušené ID a vs_currency. Předpokládáme BTC/USDT.
+    # Pro jednoduchost budeme zatím podporovat jen BTCUSDT. Pokud byste potřeboval/a jiné páry, bude třeba složitější mapování.
+    coin_id = "bitcoin" if symbol == "BTCUSDT" else None
+    vs_currency = "usd" # CoinGecko používá "usd" jako protiměnu, což je ekvivalent USDT na burzách.
 
-async def get_price(symbol: str):
+    if coin_id is None:
+        log(f"CoinGecko: Nepodporovaný symbol {symbol} pro CoinGecko API.")
+        return None
+
     try:
-        return await asyncio.to_thread(get_price_sync, symbol)
+        r = requests.get(
+            COINGECKO_PRICE_URL, 
+            params={"ids": coin_id, "vs_currencies": vs_currency}, 
+            timeout=8
+        ) 
+        r.raise_for_status()
+        
+        data = r.json()
+        
+        # CoinGecko vrací strukturu {'bitcoin': {'usd': XXXXX}}
+        if coin_id in data and vs_currency in data[coin_id]:
+            return float(data[coin_id][vs_currency])
+        
+        log(f"CoinGecko API: Price not found in response for {symbol}. Raw response: {data}")
+        return None
     except requests.exceptions.HTTPError as e:
-        # TADY SE UKÁŽE, JESTLI JE TO ZASE CHYBA 451
-        log(f"get_price({symbol}) HTTPError: {e.response.status_code} - {e}")
+        log(f"get_price({symbol}) CoinGecko HTTPError: {e.response.status_code} - {e}")
         return None
     except Exception as e:
         log(f"get_price({symbol}) error: {e}")
         return None
+
+async def get_price(symbol: str):
+    return await asyncio.to_thread(get_price_sync, symbol)
 
 def save_signal(conn, source_message_id, s):
     try:
