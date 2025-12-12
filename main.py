@@ -15,7 +15,7 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# SPOT price endpoint (US region-safe)
+# SPOT price endpoint (většinou bez geobloku)
 BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
@@ -24,7 +24,6 @@ ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", r
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def connect_db():
-    # check_same_thread=False = bezpečnější, když conn používá víc async tasků
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -124,7 +123,7 @@ async def post(bot: Bot, text: str):
     try:
         await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=True)
     except TelegramError as e:
-        log(f"post() TelegramError: {e}")
+        log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
 def get_price_sync(symbol: str):
     r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=8)
@@ -159,14 +158,8 @@ async def fetch_channel_posts(bot: Bot, last_update_id: int):
             allowed_updates=["channel_post", "edited_channel_post"]
         )
     except TelegramError as e:
-        msg = str(e)
-        log(f"get_updates TelegramError: {msg}")
-
-        # Tvrdý fix: když je Conflict, znamená to, že někde běží jiný getUpdates.
-        # Ukončíme proces -> Render ho nahodí čistě.
-        if "Conflict" in msg:
-            raise SystemExit("Conflict: another getUpdates is running")
-
+        # Tady je teď klíč – uvidíme reálný typ chyby (Forbidden/BadRequest/Conflict/Unauthorized…)
+        log(f"get_updates TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
         return last_update_id, []
 
     if not updates:
@@ -249,12 +242,8 @@ async def main_async():
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    # 1x start notifikace na každý commit (funguje správně až s persistent DB_PATH)
-    render_commit = os.getenv("RENDER_GIT_COMMIT", "").strip() or "unknown"
-    last_notified_commit = state_get(conn, "startup_notified_commit", "")
-    if last_notified_commit != render_commit:
-        await post(bot, "🤖 Bot běží.")
-        state_set(conn, "startup_notified_commit", render_commit)
+    # Startup message (zatím jednoduchý – DB není persistentní)
+    await post(bot, "🤖 Bot běží.")
 
     last_update_id = int(state_get(conn, "last_update_id", "0"))
 
