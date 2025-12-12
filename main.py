@@ -15,7 +15,8 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-BINANCE_FAPI_PRICE = "https://api.binance.com/api/v3/ticker/price"
+# SPOT price endpoint (US region-safe)
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -23,7 +24,11 @@ ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", r
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def connect_db():
-    conn = sqlite3.connect(DB_PATH)
+    # check_same_thread=False = bezpečnější, když conn používá víc async tasků
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +53,7 @@ def connect_db():
             v TEXT NOT NULL
         )
     """)
+    conn.commit()
     return conn
 
 def state_get(conn, key, default):
@@ -55,7 +61,10 @@ def state_get(conn, key, default):
     return row[0] if row else default
 
 def state_set(conn, key, value):
-    conn.execute("INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+    conn.execute(
+        "INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (key, value)
+    )
     conn.commit()
 
 def parse_range(a, b):
@@ -116,10 +125,9 @@ async def post(bot: Bot, text: str):
         await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=True)
     except TelegramError as e:
         log(f"post() TelegramError: {e}")
-        pass
 
 def get_price_sync(symbol: str):
-    r = requests.get(BINANCE_FAPI_PRICE, params={"symbol": symbol}, timeout=8)
+    r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=8)
     r.raise_for_status()
     return float(r.json()["price"])
 
@@ -151,7 +159,14 @@ async def fetch_channel_posts(bot: Bot, last_update_id: int):
             allowed_updates=["channel_post", "edited_channel_post"]
         )
     except TelegramError as e:
-        log(f"get_updates TelegramError: {e}")
+        msg = str(e)
+        log(f"get_updates TelegramError: {msg}")
+
+        # Tvrdý fix: když je Conflict, znamená to, že někde běží jiný getUpdates.
+        # Ukončíme proces -> Render ho nahodí čistě.
+        if "Conflict" in msg:
+            raise SystemExit("Conflict: another getUpdates is running")
+
         return last_update_id, []
 
     if not updates:
@@ -178,10 +193,7 @@ async def monitor_prices(bot: Bot, conn):
                 "SELECT id, symbol, side, entry1_low, entry1_high, tps_json, activated, tp_hits FROM signals"
             ).fetchall()
 
-            if rows:
-                log(f"monitor tick: signals={len(rows)}")
-            else:
-                log("monitor tick: no signals")
+            log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
             for sid, symbol, side, e1l, e1h, tps_json, activated, tp_hits in rows:
                 price = await get_price(symbol)
@@ -207,8 +219,6 @@ async def monitor_prices(bot: Bot, conn):
                             f"Aktuální cena: {fmt(price)}\n"
                             f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
                         )
-                    else:
-                        log(f"not activated: price {price} not in [{e1l},{e1h}]")
                     continue
 
                 # TP hits (až po aktivaci)
@@ -239,9 +249,14 @@ async def main_async():
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    last_update_id = int(state_get(conn, "last_update_id", "0"))
+    # 1x start notifikace na každý commit (funguje správně až s persistent DB_PATH)
+    render_commit = os.getenv("RENDER_GIT_COMMIT", "").strip() or "unknown"
+    last_notified_commit = state_get(conn, "startup_notified_commit", "")
+    if last_notified_commit != render_commit:
+        await post(bot, "🤖 Bot běží.")
+        state_set(conn, "startup_notified_commit", render_commit)
 
-    await post(bot, "🤖 Bot běží. Čekám na nové signály ve VIP signály.")
+    last_update_id = int(state_get(conn, "last_update_id", "0"))
 
     monitor_task = asyncio.create_task(monitor_prices(bot, conn))
 
@@ -265,9 +280,17 @@ async def main_async():
                     log(f"saved signal msg_id={p['message_id']} {s['symbol']} {s['side']} entry1={s['entry1_low']}-{s['entry1_high']} tps={len(s['tps'])}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
+
     finally:
         monitor_task.cancel()
+        try:
+            await monitor_task
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main_async())
-
