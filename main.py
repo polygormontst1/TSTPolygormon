@@ -3,6 +3,9 @@ import requests
 from telegram import Bot
 from telegram.error import TelegramError
 
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"].strip())
@@ -111,7 +114,8 @@ def fmt(x):
 async def post(bot: Bot, text: str):
     try:
         await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=True)
-    except TelegramError:
+    except TelegramError as e:
+        log(f"post() TelegramError: {e}")
         pass
 
 def get_price_sync(symbol: str):
@@ -122,7 +126,8 @@ def get_price_sync(symbol: str):
 async def get_price(symbol: str):
     try:
         return await asyncio.to_thread(get_price_sync, symbol)
-    except Exception:
+    except Exception as e:
+        log(f"get_price({symbol}) error: {e}")
         return None
 
 def save_signal(conn, source_message_id, s):
@@ -145,7 +150,8 @@ async def fetch_channel_posts(bot: Bot, last_update_id: int):
             timeout=20,
             allowed_updates=["channel_post", "edited_channel_post"]
         )
-    except TelegramError:
+    except TelegramError as e:
+        log(f"get_updates TelegramError: {e}")
         return last_update_id, []
 
     if not updates:
@@ -165,53 +171,71 @@ async def fetch_channel_posts(bot: Bot, last_update_id: int):
     return max_id, posts
 
 async def monitor_prices(bot: Bot, conn):
+    log("monitor_prices() started")
     while True:
-        rows = conn.execute(
-            "SELECT id, symbol, side, entry1_low, entry1_high, tps_json, activated, tp_hits FROM signals"
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT id, symbol, side, entry1_low, entry1_high, tps_json, activated, tp_hits FROM signals"
+            ).fetchall()
 
-        for sid, symbol, side, e1l, e1h, tps_json, activated, tp_hits in rows:
-            price = await get_price(symbol)
-            if price is None:
-                continue
+            if rows:
+                log(f"monitor tick: signals={len(rows)}")
+            else:
+                log("monitor tick: no signals")
 
-            tps = json.loads(tps_json)
-            e_ref = entry_ref(e1l, e1h)
+            for sid, symbol, side, e1l, e1h, tps_json, activated, tp_hits in rows:
+                price = await get_price(symbol)
+                log(f"check sid={sid} {symbol} {side} price={price} entry1={e1l}-{e1h} activated={activated} tp_hits={tp_hits}")
 
-            if not activated:
-                if e1l <= price <= e1h:
-                    conn.execute(
-                        "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                        (int(time.time()), price, sid)
-                    )
+                if price is None:
+                    continue
+
+                tps = json.loads(tps_json)
+                e_ref = entry_ref(e1l, e1h)
+
+                if not activated:
+                    if e1l <= price <= e1h:
+                        log(f"ACTIVATE sid={sid} {symbol} price={price} in [{e1l},{e1h}]")
+                        conn.execute(
+                            "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
+                            (int(time.time()), price, sid)
+                        )
+                        conn.commit()
+                        await post(bot,
+                            "✅ Signál aktivován\n"
+                            f"{symbol} ({side})\n"
+                            f"Aktuální cena: {fmt(price)}\n"
+                            f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
+                        )
+                    else:
+                        log(f"not activated: price {price} not in [{e1l},{e1h}]")
+                    continue
+
+                # TP hits (až po aktivaci)
+                while tp_hits < len(tps):
+                    tp = float(tps[tp_hits])
+                    is_hit = (price >= tp) if side == "LONG" else (price <= tp)
+                    if not is_hit:
+                        break
+                    tp_hits += 1
+                    gain = pct_from_entry(tp, e_ref, side)
+                    conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
                     conn.commit()
                     await post(bot,
-                        "✅ Signál aktivován\n"
-                        f"{symbol} ({side})\n"
-                        f"Aktuální cena: {fmt(price)}\n"
-                        f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
+                        f"🎯 {symbol} – TP{tp_hits} HIT\n"
+                        f"TP cena: {fmt(tp)}\n"
+                        f"Zisk: {gain:.2f}% (od Entry1 {ENTRY_REF_MODE})"
                     )
-                continue
 
-            # TP hits
-            while tp_hits < len(tps):
-                tp = float(tps[tp_hits])
-                is_hit = (price >= tp) if side == "LONG" else (price <= tp)
-                if not is_hit:
-                    break
-                tp_hits += 1
-                gain = pct_from_entry(tp, e_ref, side)
-                conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
-                conn.commit()
-                await post(bot,
-                    f"🎯 {symbol} – TP{tp_hits} HIT\n"
-                    f"TP cena: {fmt(tp)}\n"
-                    f"Zisk: {gain:.2f}% (od Entry1 {ENTRY_REF_MODE})"
-                )
+        except Exception as e:
+            log(f"monitor_prices loop error: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 async def main_async():
+    log("START: main_async entered")
+    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH}")
+
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
@@ -219,7 +243,6 @@ async def main_async():
 
     await post(bot, "🤖 Bot běží. Čekám na nové signály ve VIP signály.")
 
-    # start background monitor
     monitor_task = asyncio.create_task(monitor_prices(bot, conn))
 
     try:
@@ -239,6 +262,7 @@ async def main_async():
                         f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
                         f"TPs: {len(s['tps'])}"
                     )
+                    log(f"saved signal msg_id={p['message_id']} {s['symbol']} {s['side']} entry1={s['entry1_low']}-{s['entry1_high']} tps={len(s['tps'])}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:
