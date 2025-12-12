@@ -15,7 +15,8 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()  # HIGH | LOW
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# SPOT price endpoint (většinou bez geobloku)
+# NOVÝ SPOT price endpoint pro KuCoin, který obejde geoblokaci Binance.
+# Vrací všechny tickery, což vyžaduje upravenou logiku get_price_sync.
 BINANCE_PRICE_URL = "https://api.kucoin.com/api/v1/market/allTickers"
 
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
@@ -125,10 +126,33 @@ async def post(bot: Bot, text: str):
     except TelegramError as e:
         log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
+# NOVÁ A OPRAVENÁ FUNKCE PRO ZÍSKÁNÍ CENY Z KUCOINU
 def get_price_sync(symbol: str):
-    r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=8)
+    # Voláme KuCoin API pro všechny tickery (URL je už nastavená)
+    r = requests.get(BINANCE_PRICE_URL, timeout=8) 
     r.raise_for_status()
-    return float(r.json()["price"])
+    
+    data = r.json()
+    
+    # Zpracování dat pro KuCoin allTickers
+    if data.get('code') == '2000000':
+        # 1. Převod symbolu na KuCoin formát (např. BTCUSDT -> BTC-USDT)
+        kucoin_symbol = symbol.replace('USDT', '-USDT') 
+        
+        # 2. Hledání v seznamu tickerů
+        for ticker in data['data']['ticker']:
+            # Najít odpovídající symbol
+            if ticker.get('symbol') == kucoin_symbol: 
+                # KuCoin SPOT vrací cenu pod klíčem 'lastTradePrice'
+                return float(ticker['lastTradePrice'])
+        
+        # Logování, pokud symbol nebyl nalezen
+        log(f"KuCoin: Symbol {kucoin_symbol} not found in allTickers list.")
+        return None
+    else:
+        # Chyba z KuCoin API (např. servisní problém)
+        log(f"KuCoin API error: {data.get('msg', 'Unknown error')}")
+        return None
 
 async def get_price(symbol: str):
     try:
@@ -158,7 +182,6 @@ async def fetch_channel_posts(bot: Bot, last_update_id: int):
             allowed_updates=["channel_post", "edited_channel_post"]
         )
     except TelegramError as e:
-        # Tady je teď klíč – uvidíme reálný typ chyby (Forbidden/BadRequest/Conflict/Unauthorized…)
         log(f"get_updates TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
         return last_update_id, []
 
@@ -182,15 +205,17 @@ async def monitor_prices(bot: Bot, conn):
     log("monitor_prices() started")
     while True:
         try:
+            # Opravený SQL dotaz: Načítáme i Entry 2 (e2l, e2h)
             rows = conn.execute(
-                "SELECT id, symbol, side, entry1_low, entry1_high, tps_json, activated, tp_hits FROM signals"
+                "SELECT id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, activated, tp_hits FROM signals"
             ).fetchall()
 
             log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
-            for sid, symbol, side, e1l, e1h, tps_json, activated, tp_hits in rows:
+            # Přizpůsobený cyklus pro čtení E2
+            for sid, symbol, side, e1l, e1h, e2l, e2h, tps_json, activated, tp_hits in rows:
                 price = await get_price(symbol)
-                log(f"check sid={sid} {symbol} {side} price={price} entry1={e1l}-{e1h} activated={activated} tp_hits={tp_hits}")
+                log(f"check sid={sid} {symbol} {side} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits}")
 
                 if price is None:
                     continue
@@ -199,8 +224,19 @@ async def monitor_prices(bot: Bot, conn):
                 e_ref = entry_ref(e1l, e1h)
 
                 if not activated:
+                    # NOVÁ LOGIKA AKTIVACE: Kontrola Entry 1 OR Entry 2
+                    is_activated = False
+                    
+                    # 1. Kontrola Entry 1
                     if e1l <= price <= e1h:
-                        log(f"ACTIVATE sid={sid} {symbol} price={price} in [{e1l},{e1h}]")
+                        is_activated = True
+                    
+                    # 2. Kontrola Entry 2 (pouze pokud existuje)
+                    if not is_activated and e2l is not None and e2h is not None and e2l <= price <= e2h:
+                        is_activated = True
+                    
+                    if is_activated:
+                        log(f"ACTIVATE sid={sid} {symbol} price={price} in range.")
                         conn.execute(
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
                             (int(time.time()), price, sid)
@@ -264,9 +300,10 @@ async def main_async():
                         "🆕 Nový signál uložen\n"
                         f"{s['symbol']} ({s['side']})\n"
                         f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
+                        f"Entry2: {fmt(s['entry2_low'])} - {fmt(s['entry2_high'])}\n"
                         f"TPs: {len(s['tps'])}"
                     )
-                    log(f"saved signal msg_id={p['message_id']} {s['symbol']} {s['side']} entry1={s['entry1_low']}-{s['entry1_high']} tps={len(s['tps'])}")
+                    log(f"saved signal msg_id={p['message_id']} {s['symbol']} {s['side']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -283,5 +320,3 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
-
-
