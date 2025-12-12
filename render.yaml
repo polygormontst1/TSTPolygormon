@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: vip-signal-tracker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
