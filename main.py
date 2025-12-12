@@ -10,9 +10,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"].strip())
 
-# ZDE VLOŽTE URL VAŠEHO CLOUDFLARE WORKERU!
-# MĚLO BY TO BÝT TO, CO JSTE ZKOPÍROVAL/A V KROKU 2!
-PROXY_PRICE_URL = "https://VASE-URL-WORKERU.workers.dev" 
+# FINÁLNÍ A OPRAVENÁ URL VAŠEHO CLOUDFLARE WORKERU
+PROXY_PRICE_URL = "https://workerrr.developctsro.workers.dev" 
 
 # Můžeme se vrátit k rychlejšímu intervalu (15s), protože proxy by měla být stabilní
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "15")) 
