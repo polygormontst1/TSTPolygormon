@@ -1,3 +1,4 @@
+# Cisty start
 import os, re, time, json, sqlite3, asyncio
 import requests
 from telegram import Bot
@@ -313,3 +314,4 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
