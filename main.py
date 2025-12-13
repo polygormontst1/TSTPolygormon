@@ -1,16 +1,4 @@
-# main.py — Telegram Trading Signals Bot (Polling)
-# RULES:
-# 1) "Long" / "Short"  => MARKET (aktivace ihned)
-# 2) "Buy on" / "Short on" => WAIT (aktivace až když cena vstoupí do Entry1/Entry2)
-#
-# Routing:
-# - "🆕 Nový signál uložen" => SOURCE
-# - "✅ Signál aktivován" + "🎯 TP hit" => TARGET
-#
-# Price:
-# - přes Cloudflare Worker: https://workerrr.developctsro.workers.dev/?symbol=BTCUSDT
-
-import os, re, time, json, sqlite3, asyncio
+import os, re, time, json, sqlite3, asyncio, uuid
 import requests
 from telegram import Bot
 from telegram.error import TelegramError
@@ -31,24 +19,22 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
+# Lock (anti-Conflict)
+INSTANCE_ID = os.getenv("INSTANCE_ID", str(uuid.uuid4())[:8])
+LOCK_KEY_OWNER = "poll_lock_owner"
+LOCK_KEY_TS = "poll_lock_ts"
+LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "45"))   # jak dlouho je lock platný bez refresh
+LOCK_REFRESH_SEC = int(os.getenv("LOCK_REFRESH_SEC", "10"))
+
 # =========================
 # PARSING
 # =========================
-# Chytí:
-# BTC/USDT Long
-# BTC/USDT Short
-# BTC/USDT Buy on
-# BTC/USDT Short on
-# + toleruje extra text za tím (např. "on spot", "on futures", atd.)
 PAIR_RE = re.compile(
     r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(LONG|SHORT|BUY|SELL)\b(?:\s+(ON)\b)?",
     re.IGNORECASE | re.MULTILINE
 )
-
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
-
-# Bere TP z bloku "Rezistenční úrovně:" až do konce / Stop Loss
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def parse_range(a, b):
@@ -76,15 +62,13 @@ def parse_signal(text: str):
 
     base = m.group(1).upper()
     quote = m.group(2).upper()
-    action = (m.group(3) or "").lower()       # long/short/buy/sell
+    action = (m.group(3) or "").lower()
     has_on = (m.group(4) or "").lower() == "on"
     symbol = f"{base}{quote}"
 
-    # MODE + SIDE pravidla podle tebe:
-    # - Long / Short => MARKET (okamžitě)
-    # - Buy on / Short on => WAIT (čeká na Entry)
-    #
-    # Pozn.: "Short on" je WAIT short, "Short" bez "on" je MARKET short.
+    # Tvoje pravidla:
+    # - Long / Short => MARKET (aktivace ihned)
+    # - Buy on / Short on => WAIT (čeká na entry)
     if action == "long":
         side = "LONG"
         mode = "MARKET"
@@ -93,15 +77,13 @@ def parse_signal(text: str):
         mode = "WAIT" if has_on else "MARKET"
     elif action == "buy":
         side = "LONG"
-        mode = "WAIT"  # "Buy" bez on nečekám, ale beru jako WAIT (bezpečné)
+        mode = "WAIT"
     elif action == "sell":
         side = "SHORT"
-        mode = "WAIT"  # "Sell" beru jako čekací short
+        mode = "WAIT"
     else:
         return None
 
-    # Entry1 je povinné pro WAIT. Pro MARKET ho taky chceme (kvůli DB/TP výpočtům),
-    # ale když by chybělo, radši signál ignoruj (ať nemáme divný data).
     e1 = ENTRY1_RE.search(text or "")
     if not e1:
         return None
@@ -112,7 +94,6 @@ def parse_signal(text: str):
     if e2:
         entry2_low, entry2_high = parse_range(e2.group(1), e2.group(2))
 
-    # TPs
     rm = RES_RE.search(text or "")
     if not rm:
         return None
@@ -169,12 +150,11 @@ def connect_db():
         )
     """)
 
-    # Přidání sloupce mode pro starou DB (když už existuje)
     try:
         conn.execute("ALTER TABLE signals ADD COLUMN mode TEXT NOT NULL DEFAULT 'WAIT'")
         conn.commit()
     except sqlite3.OperationalError:
-        pass  # už existuje
+        pass
 
     conn.commit()
     return conn
@@ -240,7 +220,6 @@ def get_price_sync(symbol: str):
         if r.status_code != 200:
             log(f"get_price({symbol}) worker status={r.status_code} body={r.text[:200]}")
             return None
-
         data = r.json()
         if isinstance(data, dict) and "price" in data:
             return float(data["price"])
@@ -251,6 +230,38 @@ def get_price_sync(symbol: str):
 
 async def get_price(symbol: str):
     return await asyncio.to_thread(get_price_sync, symbol)
+
+# =========================
+# ANTI-CONFLICT LOCK
+# =========================
+def try_acquire_lock(conn) -> bool:
+    now = int(time.time())
+    owner = state_get(conn, LOCK_KEY_OWNER, "")
+    ts = int(state_get(conn, LOCK_KEY_TS, "0"))
+
+    # lock volný / lock prošlý
+    if (not owner) or (now - ts > LOCK_TTL_SEC):
+        state_set(conn, LOCK_KEY_OWNER, INSTANCE_ID)
+        state_set(conn, LOCK_KEY_TS, str(now))
+        log(f"LOCK ACQUIRED owner={INSTANCE_ID} (prev_owner={owner or '-'} age={now-ts}s)")
+        return True
+
+    # lock držíme my
+    if owner == INSTANCE_ID:
+        state_set(conn, LOCK_KEY_TS, str(now))
+        return True
+
+    # lock drží někdo jiný
+    log(f"LOCK BUSY owner={owner} age={now-ts}s (me={INSTANCE_ID})")
+    return False
+
+def refresh_lock(conn) -> bool:
+    now = int(time.time())
+    owner = state_get(conn, LOCK_KEY_OWNER, "")
+    if owner != INSTANCE_ID:
+        return False
+    state_set(conn, LOCK_KEY_TS, str(now))
+    return True
 
 # =========================
 # POLLING
@@ -278,8 +289,6 @@ async def fetch_channel_posts(bot: Bot, last_update_id: int):
             continue
         if not cp.chat or cp.chat.id != SOURCE_CHAT_ID:
             continue
-
-        # text / caption (u fotek bude caption)
         text = (cp.text or cp.caption or "")
         posts.append({"message_id": cp.message_id, "text": text})
     return max_id, posts
@@ -311,7 +320,6 @@ async def monitor_prices(bot: Bot, conn):
                 tps = json.loads(tps_json)
                 e_ref = entry_ref(e1l, e1h)
 
-                # WAIT signály: aktivace až při vstupu do Entry
                 if not activated and mode == "WAIT":
                     in_entry = (e1l <= price <= e1h)
                     if (not in_entry) and (e2l is not None) and (e2h is not None):
@@ -332,7 +340,6 @@ async def monitor_prices(bot: Bot, conn):
                         )
                     continue
 
-                # TP (po aktivaci)
                 if activated:
                     while tp_hits < len(tps):
                         tp = float(tps[tp_hits])
@@ -359,23 +366,38 @@ async def monitor_prices(bot: Bot, conn):
 # =========================
 async def main_async():
     log("START: main_async entered")
-    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH}")
+    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} INSTANCE={INSTANCE_ID}")
+
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    # Startup ping max 1x/24h (anti spam)
+    # acquire lock or exit
+    if not try_acquire_lock(conn):
+        log("EXIT: another instance holds the lock. (prevents getUpdates Conflict)")
+        return
+
+    # startup ping 1x/24h
     now = int(time.time())
     last_ping = int(state_get(conn, "startup_ping_ts", "0"))
     if now - last_ping > 24 * 3600:
-        await post_target(bot, "🤖 Bot běží.")
+        await post_target(bot, f"🤖 Bot běží. (instance {INSTANCE_ID})")
         state_set(conn, "startup_ping_ts", str(now))
 
     last_update_id = int(state_get(conn, "last_update_id", "0"))
 
     monitor_task = asyncio.create_task(monitor_prices(bot, conn))
 
+    last_lock_refresh = 0
+
     try:
         while True:
+            # refresh lock
+            if time.time() - last_lock_refresh > LOCK_REFRESH_SEC:
+                if not refresh_lock(conn):
+                    log("EXIT: lost lock to another instance.")
+                    return
+                last_lock_refresh = time.time()
+
             last_update_id, posts = await fetch_channel_posts(bot, last_update_id)
             state_set(conn, "last_update_id", str(last_update_id))
 
@@ -392,7 +414,6 @@ async def main_async():
                 if s["entry2_low"] is not None and s["entry2_high"] is not None:
                     entry2_line = f"Entry2: {fmt(s['entry2_low'])} - {fmt(s['entry2_high'])}\n"
 
-                # 🆕 do SOURCE
                 await post_source(bot,
                     "🆕 Nový signál uložen\n"
                     f"{s['symbol']} ({s['side']}) [{s['mode']}]\n"
@@ -403,7 +424,7 @@ async def main_async():
 
                 log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
 
-                # MARKET => aktivace ihned (bez ohledu na Entry)
+                # MARKET => aktivace ihned
                 if s["mode"] == "MARKET":
                     price_now = await get_price(s["symbol"])
                     if price_now is None:
