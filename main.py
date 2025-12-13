@@ -17,109 +17,104 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# ✅ Parsuje:
-# - BTC/USDT Long
-# - BTC/USDT Short
-# - BTC/USDT Buy on ...
-# - BTC/USDT Short on ...
-# - (volitelně) Sell on ...
-# toleruje i "on spot" apod.
+# ===== REGEX =====
 PAIR_RE = re.compile(
     r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(LONG|SHORT|BUY|SELL)\b(?:\s+(ON)\b)?",
     re.IGNORECASE | re.MULTILINE
 )
-
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
+# ===== DB =====
 def connect_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_message_id INTEGER UNIQUE,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry1_low REAL NOT NULL,
-            entry1_high REAL NOT NULL,
+            symbol TEXT,
+            side TEXT,
+            entry1_low REAL,
+            entry1_high REAL,
             entry2_low REAL,
             entry2_high REAL,
-            tps_json TEXT NOT NULL,
-            created_ts INTEGER NOT NULL,
-            activated INTEGER NOT NULL DEFAULT 0,
+            tps_json TEXT,
+            created_ts INTEGER,
+            activated INTEGER DEFAULT 0,
             activated_ts INTEGER,
             activated_price REAL,
-            tp_hits INTEGER NOT NULL DEFAULT 0
+            tp_hits INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS state (
             k TEXT PRIMARY KEY,
-            v TEXT NOT NULL
+            v TEXT
         )
     """)
     conn.commit()
     return conn
 
 def state_get(conn, key, default):
-    row = conn.execute("SELECT v FROM state WHERE k=?", (key,)).fetchone()
-    return row[0] if row else default
+    r = conn.execute("SELECT v FROM state WHERE k=?", (key,)).fetchone()
+    return r[0] if r else default
 
-def state_set(conn, key, value):
+def state_set(conn, key, val):
     conn.execute(
         "INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-        (key, value)
+        (key, val)
     )
     conn.commit()
 
+# ===== HELPERS =====
 def parse_range(a, b):
     x = float(a)
     y = float(b) if b else float(a)
     return (x, y) if x <= y else (y, x)
 
-def parse_signal(text: str):
+def fmt(x):
+    if x is None:
+        return "-"
+    return f"{x:.8f}".rstrip("0").rstrip(".")
+
+def entry_ref(l, h):
+    return l if ENTRY_REF_MODE == "LOW" else h
+
+def pct_from_entry(price, entry, side):
+    return (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+
+# ===== PARSER =====
+def parse_signal(text):
     m = PAIR_RE.search(text or "")
     if not m:
         return None
 
-    base = m.group(1).upper()
-    quote = m.group(2).upper()
-    action = (m.group(3) or "").lower()       # long/short/buy/sell
-    has_on = (m.group(4) or "").lower() == "on"  # True/False
+    base, quote, action, on_word = m.groups()
+    action = action.lower()
+    has_on = bool(on_word)
 
-    # Side map
     side = "LONG" if action in ("long", "buy") else "SHORT"
-    symbol = f"{base}{quote}"
+    symbol = f"{base.upper()}{quote.upper()}"
 
-    # ✅ PRAVIDLO OD TEBE:
-    # - Long/Short bez "on" => market NOW (aktivace ihned)
-    # - Buy on / Short on (a obecně cokoliv s "on") => čekací (trigger přes Entry)
-    auto_activate = (action in ("long", "short")) and (not has_on)
+    auto_activate = action in ("long", "short") and not has_on
 
-    # Entry1 pořád vyžadujeme (kvůli DB / pozdějším TP výpočtům)
-    e1 = ENTRY1_RE.search(text or "")
+    e1 = ENTRY1_RE.search(text)
     if not e1:
         return None
     entry1_low, entry1_high = parse_range(e1.group(1), e1.group(2))
 
-    e2 = ENTRY2_RE.search(text or "")
+    e2 = ENTRY2_RE.search(text)
     entry2_low = entry2_high = None
     if e2:
         entry2_low, entry2_high = parse_range(e2.group(1), e2.group(2))
 
-    rm = RES_RE.search(text or "")
+    rm = RES_RE.search(text)
     if not rm:
         return None
-    raw = rm.group(1)
-
-    nums = re.findall(r"([0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]+)?)", raw.replace(",", " "))
-    tps = [float(n) for n in nums]
-    if not tps:
-        return None
-    tps = sorted(tps, reverse=(side == "SHORT"))
+    nums = re.findall(r"([0-9]*\.?[0-9]+)", rm.group(1))
+    tps = sorted([float(n) for n in nums], reverse=(side == "SHORT"))
 
     return {
         "symbol": symbol,
@@ -132,247 +127,140 @@ def parse_signal(text: str):
         "auto_activate": auto_activate
     }
 
-def entry_ref(entry1_low, entry1_high):
-    return entry1_low if ENTRY_REF_MODE == "LOW" else entry1_high
-
-def pct_from_entry(price, entry, side):
-    return (price - entry) / entry * 100.0 if side == "LONG" else (entry - price) / entry * 100.0
-
-def fmt(x):
-    return f"{x:.8f}".rstrip("0").rstrip(".")
-
-async def post_target(bot: Bot, text: str):
+# ===== PRICE =====
+def get_price_sync(symbol):
     try:
-        await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=True)
-    except TelegramError as e:
-        log(f"post_target() TelegramError: {repr(e)}")
-
-async def post_source(bot: Bot, text: str):
-    try:
-        await bot.send_message(chat_id=SOURCE_CHAT_ID, text=text, disable_web_page_preview=True)
-    except TelegramError as e:
-        log(f"post_source() TelegramError: {repr(e)}")
-
-def get_price_sync(symbol: str):
-    try:
-        r = requests.get(
-            PROXY_PRICE_URL,
-            params={"symbol": symbol},
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
-        )
-
+        r = requests.get(PROXY_PRICE_URL, params={"symbol": symbol}, timeout=8)
         if r.status_code != 200:
-            log(f"get_price({symbol}) worker status={r.status_code} body={r.text[:300]}")
+            log(f"get_price({symbol}) status={r.status_code}")
             return None
-
-        data = r.json()
-        if isinstance(data, dict) and ("price" in data):
-            try:
-                return float(data["price"])
-            except Exception:
-                log(f"get_price({symbol}) invalid price={data.get('price')} raw={data}")
-                return None
-
-        log(f"get_price({symbol}) invalid response json={data}")
-        return None
-
+        d = r.json()
+        return float(d["price"]) if "price" in d else None
     except Exception as e:
-        log(f"get_price({symbol}) error: {e}")
+        log(f"get_price({symbol}) error {e}")
         return None
 
-async def get_price(symbol: str):
+async def get_price(symbol):
     return await asyncio.to_thread(get_price_sync, symbol)
 
-def save_signal(conn, source_message_id, s):
+# ===== TELEGRAM =====
+async def post(chat_id, bot, text):
     try:
-        cur = conn.execute(
-            """INSERT INTO signals(
-                source_message_id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, created_ts
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
-            (
-                source_message_id,
-                s["symbol"],
-                s["side"],
-                s["entry1_low"],
-                s["entry1_high"],
-                s["entry2_low"],
-                s["entry2_high"],
-                json.dumps(s["tps"]),
-                int(time.time())
-            )
-        )
-        conn.commit()
-        return cur.lastrowid
-    except sqlite3.IntegrityError:
-        return None
-
-async def fetch_channel_posts(bot: Bot, last_update_id: int):
-    try:
-        updates = await bot.get_updates(
-            offset=last_update_id + 1,
-            timeout=20,
-            allowed_updates=["channel_post", "edited_channel_post"]
-        )
+        await bot.send_message(chat_id=chat_id, text=text)
     except TelegramError as e:
-        log(f"get_updates TelegramError: {repr(e)}")
-        return last_update_id, []
+        log(f"TelegramError {e}")
 
-    if not updates:
-        return last_update_id, []
-
-    max_id = last_update_id
-    posts = []
-    for u in updates:
-        max_id = max(max_id, u.update_id)
-        cp = u.channel_post or u.edited_channel_post
-        if not cp:
-            continue
-        if not cp.chat or cp.chat.id != SOURCE_CHAT_ID:
-            continue
-        text = (cp.text or cp.caption or "")
-        posts.append({"message_id": cp.message_id, "text": text})
-    return max_id, posts
-
-async def monitor_prices(bot: Bot, conn):
+# ===== MONITOR =====
+async def monitor_prices(bot, conn):
     log("monitor_prices() started")
     while True:
-        try:
-            rows = conn.execute(
-                "SELECT id, symbol, side, entry1_low, entry1_high, entry2_low, entry2_high, tps_json, activated, tp_hits FROM signals"
-            ).fetchall()
+        rows = conn.execute(
+            "SELECT id,symbol,side,entry1_low,entry1_high,entry2_low,entry2_high,tps_json,activated,tp_hits FROM signals"
+        ).fetchall()
 
-            log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
+        log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
-            for sid, symbol, side, e1l, e1h, e2l, e2h, tps_json, activated, tp_hits in rows:
-                price = await get_price(symbol)
-                log(f"check sid={sid} {symbol} {side} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits}")
+        for r in rows:
+            sid,symbol,side,e1l,e1h,e2l,e2h,tps_json,activated,tp_hits = r
+            price = await get_price(symbol)
+            log(f"check sid={sid} {symbol} price={price}")
 
-                if price is None:
-                    continue
+            if price is None:
+                continue
 
-                tps = json.loads(tps_json)
-                e_ref = entry_ref(e1l, e1h)
+            tps = json.loads(tps_json)
 
-                # ✅ ČEKACÍ SIGNÁLY: aktivace jen při vstupu do Entry range
-                if not activated:
-                    is_activated = False
-
-                    if e1l <= price <= e1h:
-                        is_activated = True
-
-                    if (not is_activated) and (e2l is not None) and (e2h is not None) and (e2l <= price <= e2h):
-                        is_activated = True
-
-                    if is_activated:
-                        log(f"ACTIVATE sid={sid} {symbol} price={price} in range.")
-                        conn.execute(
-                            "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                            (int(time.time()), price, sid)
-                        )
-                        conn.commit()
-                        await post_target(bot,
-                            "✅ Signál aktivován\n"
-                            f"{symbol} ({side})\n"
-                            f"Aktuální cena: {fmt(price)}\n"
-                            f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
-                        )
-                    continue
-
-                # TP hits (po aktivaci)
-                while tp_hits < len(tps):
-                    tp = float(tps[tp_hits])
-                    is_hit = (price >= tp) if side == "LONG" else (price <= tp)
-                    if not is_hit:
-                        break
-                    tp_hits += 1
-                    gain = pct_from_entry(tp, e_ref, side)
-                    conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
-                    conn.commit()
-                    await post_target(bot,
-                        f"🎯 {symbol} – TP{tp_hits} HIT\n"
-                        f"TP cena: {fmt(tp)}\n"
-                        f"Zisk: {gain:.2f}% (od Entry1 {ENTRY_REF_MODE})"
+            if not activated:
+                if (e1l <= price <= e1h) or (e2l and e2l <= price <= e2h):
+                    conn.execute(
+                        "UPDATE signals SET activated=1,activated_ts=?,activated_price=? WHERE id=?",
+                        (int(time.time()), price, sid)
                     )
+                    conn.commit()
+                    await post(TARGET_CHAT_ID, bot,
+                        f"✅ Signál aktivován\n{symbol} ({side})\nCena: {fmt(price)}"
+                    )
+                continue
 
-        except Exception as e:
-            log(f"monitor_prices loop error: {e}")
+            while tp_hits < len(tps):
+                tp = tps[tp_hits]
+                hit = price >= tp if side == "LONG" else price <= tp
+                if not hit:
+                    break
+                tp_hits += 1
+                conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
+                conn.commit()
+                gain = pct_from_entry(tp, entry_ref(e1l,e1h), side)
+                await post(TARGET_CHAT_ID, bot,
+                    f"🎯 {symbol} TP{tp_hits} HIT\nCena: {fmt(tp)}\nZisk: {gain:.2f}%"
+                )
 
         await asyncio.sleep(CHECK_INTERVAL_SEC)
 
+# ===== MAIN =====
 async def main_async():
     log("START: main_async entered")
-    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH}")
-
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    # Startup ping max 1x/24h (anti spam)
-    now = int(time.time())
-    last_ping = int(state_get(conn, "startup_ping_ts", "0"))
-    if now - last_ping > 24 * 3600:
-        await post_target(bot, "🤖 Bot běží. Cena z Worker Proxy.")
-        state_set(conn, "startup_ping_ts", str(now))
-
     last_update_id = int(state_get(conn, "last_update_id", "0"))
-
     monitor_task = asyncio.create_task(monitor_prices(bot, conn))
 
-    try:
-        while True:
-            last_update_id, posts = await fetch_channel_posts(bot, last_update_id)
-            state_set(conn, "last_update_id", str(last_update_id))
+    while True:
+        updates = await bot.get_updates(offset=last_update_id + 1, timeout=20)
+        for u in updates:
+            last_update_id = max(last_update_id, u.update_id)
+            msg = u.channel_post
+            if not msg or msg.chat.id != SOURCE_CHAT_ID:
+                continue
 
-            for p in posts:
-                s = parse_signal(p["text"])
-                if not s:
-                    continue
+            s = parse_signal(msg.text or "")
+            if not s:
+                continue
 
-                sid = save_signal(conn, p["message_id"], s)
-                if not sid:
-                    continue
-
-                # ✅ Nový signál -> SOURCE
-                await post_source(bot,
-                    "🆕 Nový signál uložen\n"
-                    f"{s['symbol']} ({s['side']})\n"
-                    f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
-                    f"Entry2: {fmt(s['entry2_low'])} - {fmt(s['entry2_high'])}\n"
-                    f"TPs: {len(s['tps'])}"
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO signals
+                (source_message_id,symbol,side,entry1_low,entry1_high,entry2_low,entry2_high,tps_json,created_ts)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    msg.message_id,
+                    s["symbol"], s["side"],
+                    s["entry1_low"], s["entry1_high"],
+                    s["entry2_low"], s["entry2_high"],
+                    json.dumps(s["tps"]),
+                    int(time.time())
                 )
+            )
+            conn.commit()
+            if cur.rowcount == 0:
+                continue
 
-                log(f"saved signal msg_id={p['message_id']} {s['symbol']} {s['side']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])} auto_activate={s['auto_activate']}")
+            entry2_line = ""
+            if s["entry2_low"] is not None:
+                entry2_line = f"Entry2: {fmt(s['entry2_low'])} - {fmt(s['entry2_high'])}\n"
 
-                # ✅ MARKET SIGNÁLY (Long/Short) -> aktivace ihned, NEřeší Entry
-                if s.get("auto_activate"):
-                    price_now = await get_price(s["symbol"])
-                    if price_now is None:
-                        log(f"auto_activate: price None for {s['symbol']} -> skipping immediate activation")
-                    else:
-                        conn.execute(
-                            "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                            (int(time.time()), price_now, sid)
-                        )
-                        conn.commit()
-                        await post_target(bot,
-                            "✅ Signál aktivován (market)\n"
-                            f"{s['symbol']} ({s['side']})\n"
-                            f"Aktuální cena: {fmt(price_now)}"
-                        )
-                        log(f"auto_activate DONE sid={sid} {s['symbol']} price={price_now}")
+            await post(SOURCE_CHAT_ID, bot,
+                "🆕 Nový signál uložen\n"
+                f"{s['symbol']} ({s['side']})\n"
+                f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
+                f"{entry2_line}"
+                f"TPs: {len(s['tps'])}"
+            )
 
-            await asyncio.sleep(POLL_INTERVAL_SEC)
+            if s["auto_activate"]:
+                price = await get_price(s["symbol"])
+                if price:
+                    conn.execute(
+                        "UPDATE signals SET activated=1,activated_ts=?,activated_price=? WHERE source_message_id=?",
+                        (int(time.time()), price, msg.message_id)
+                    )
+                    conn.commit()
+                    await post(TARGET_CHAT_ID, bot,
+                        f"✅ Signál aktivován (market)\n{s['symbol']} ({s['side']})\nCena: {fmt(price)}"
+                    )
 
-    finally:
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        state_set(conn, "last_update_id", str(last_update_id))
+        await asyncio.sleep(POLL_INTERVAL_SEC)
 
 if __name__ == "__main__":
     asyncio.run(main_async())
