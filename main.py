@@ -11,16 +11,15 @@ BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"].strip())
 
-# FINÁLNÍ A OPRAVENÁ URL VAŠEHO CLOUDFLARE WORKERU
-PROXY_PRICE_URL = "https://workerrr.developctsro.workers.dev" 
+# FINÁLNÍ URL VAŠEHO CLOUDFLARE WORKERU
+PROXY_PRICE_URL = "https://workerrr.developctsro.workers.dev"
 
-# Můžeme se vrátit k rychlejšímu intervalu (15s), protože proxy by měla být stabilní
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "15")) 
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "15"))
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# REGEX A DB FUNKCE (ZŮSTÁVAJÍ STEJNÉ)
+# REGEX
 PAIR_RE = re.compile(r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(Buy|Sell)\s*on", re.IGNORECASE | re.MULTILINE)
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
@@ -121,40 +120,53 @@ def pct_from_entry(price, entry, side):
 def fmt(x):
     return f"{x:.8f}".rstrip("0").rstrip(".")
 
-async def post(bot: Bot, text: str):
+async def post_target(bot: Bot, text: str):
     try:
         await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=True)
     except TelegramError as e:
-        log(f"post() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
+        log(f"post_target() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
 
-# get_price_sync VOLÁ VÁŠ CLOUDFLARE WORKER
+async def post_source(bot: Bot, text: str):
+    try:
+        await bot.send_message(chat_id=SOURCE_CHAT_ID, text=text, disable_web_page_preview=True)
+    except TelegramError as e:
+        log(f"post_source() TelegramError type={type(e).__name__} repr={repr(e)} str={str(e)}")
+
+# get_price_sync VOLÁ CLOUDFLARE WORKER a loguje body při chybě
 def get_price_sync(symbol: str):
-    
     try:
         r = requests.get(
-            PROXY_PRICE_URL, 
-            params={"symbol": symbol}, 
-            timeout=8
-        ) 
-        r.raise_for_status()
-        
-        data = r.json()
-        
-        # Očekáváme jednoduchý JSON z Workeru: {"price": XXXXX}
-        if 'price' in data:
-            price = float(data['price'])
-            return price
-        
-        # Kontrola, zda Worker vrátil chybu
-        if 'error' in data:
-            log(f"Proxy Worker error for {symbol}: {data['error']}")
+            PROXY_PRICE_URL,
+            params={"symbol": symbol},
+            timeout=8,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+            }
+        )
+
+        body_preview = r.text[:500]
+
+        if r.status_code != 200:
+            log(f"get_price({symbol}) worker status={r.status_code} body={body_preview}")
             return None
 
-        log(f"Proxy API: Invalid response for {symbol}. Raw response: {data}")
+        data = r.json()
+
+        if isinstance(data, dict) and ("price" in data):
+            try:
+                return float(data["price"])
+            except Exception:
+                log(f"get_price({symbol}) invalid price field={data.get('price')} body={body_preview}")
+                return None
+
+        if isinstance(data, dict) and data.get("ok") is False:
+            log(f"get_price({symbol}) worker ok=false data={data}")
+            return None
+
+        log(f"get_price({symbol}) invalid response json={data} body={body_preview}")
         return None
-    except requests.exceptions.HTTPError as e:
-        log(f"get_price({symbol}) Worker HTTPError: {e.response.status_code} - {e}")
-        return None
+
     except Exception as e:
         log(f"get_price({symbol}) error: {e}")
         return None
@@ -223,13 +235,13 @@ async def monitor_prices(bot: Bot, conn):
 
                 if not activated:
                     is_activated = False
-                    
+
                     if e1l <= price <= e1h:
                         is_activated = True
-                    
+
                     if not is_activated and e2l is not None and e2h is not None and e2l <= price <= e2h:
                         is_activated = True
-                    
+
                     if is_activated:
                         log(f"ACTIVATE sid={sid} {symbol} price={price} in range.")
                         conn.execute(
@@ -237,7 +249,7 @@ async def monitor_prices(bot: Bot, conn):
                             (int(time.time()), price, sid)
                         )
                         conn.commit()
-                        await post(bot,
+                        await post_target(bot,
                             "✅ Signál aktivován\n"
                             f"{symbol} ({side})\n"
                             f"Aktuální cena: {fmt(price)}\n"
@@ -254,7 +266,7 @@ async def monitor_prices(bot: Bot, conn):
                     gain = pct_from_entry(tp, e_ref, side)
                     conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
                     conn.commit()
-                    await post(bot,
+                    await post_target(bot,
                         f"🎯 {symbol} – TP{tp_hits} HIT\n"
                         f"TP cena: {fmt(tp)}\n"
                         f"Zisk: {gain:.2f}% (od Entry1 {ENTRY_REF_MODE})"
@@ -272,8 +284,12 @@ async def main_async():
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    # Startup message
-    await post(bot, "🤖 Bot běží. Cena z Worker Proxy.")
+    # Startup message (max 1x za 24h)
+    last = state_get(conn, "startup_ping_ts", "0")
+    now = int(time.time())
+    if now - int(last) > 24 * 3600:
+        await post_target(bot, "🤖 Bot běží. Cena z Worker Proxy.")
+        state_set(conn, "startup_ping_ts", str(now))
 
     last_update_id = int(state_get(conn, "last_update_id", "0"))
 
@@ -290,7 +306,8 @@ async def main_async():
                     continue
                 inserted = save_signal(conn, p["message_id"], s)
                 if inserted:
-                    await post(bot,
+                    # Nový signál -> SOURCE (dle vašeho pravidla)
+                    await post_source(bot,
                         "🆕 Nový signál uložen\n"
                         f"{s['symbol']} ({s['side']})\n"
                         f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
@@ -314,4 +331,3 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
-
