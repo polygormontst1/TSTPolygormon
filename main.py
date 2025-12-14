@@ -1,4 +1,4 @@
-import os, re, time, json, sqlite3, asyncio, signal
+import os, re, time, json, sqlite3, asyncio
 import requests
 from telegram import Bot
 from telegram.error import TelegramError
@@ -20,12 +20,14 @@ ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Lease-lock
-LOCK_LEASE_SEC = int(os.getenv("LOCK_LEASE_SEC", "120"))
-LOCK_HEARTBEAT_SEC = int(os.getenv("LOCK_HEARTBEAT_SEC", "30"))
-INSTANCE_ID = f"{os.getenv('RENDER_INSTANCE_ID','') or os.getenv('HOSTNAME','')}-{os.getpid()}".strip("-")
+# RULES
+ACTIVATION_VALID_DAYS = int(os.getenv("ACTIVATION_VALID_DAYS", "30"))   # valid for 1EP/2EP activation from created_ts
+REPORTING_ACTIVE_DAYS = int(os.getenv("REPORTING_ACTIVE_DAYS", "60"))   # report max N days from activated_ts
+ENTRY2_DISABLE_PROFIT_PCT = float(os.getenv("ENTRY2_DISABLE_PROFIT_PCT", "18"))  # disable entry2 if perf >= N%
+
+# Telegram raw API
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================
 # PARSING
@@ -34,8 +36,10 @@ PAIR_RE = re.compile(
     r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(LONG|SHORT|BUY|SELL)\b(?:\s+(ON)\b)?",
     re.IGNORECASE | re.MULTILINE
 )
+
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
+
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def parse_range(a, b):
@@ -99,6 +103,7 @@ def parse_signal(text: str):
     if not tps:
         return None
 
+    # LONG: asc, SHORT: desc
     tps = sorted(tps, reverse=(side == "SHORT"))
 
     return {
@@ -139,7 +144,9 @@ def connect_db():
             tp_hits INTEGER NOT NULL DEFAULT 0,
             entry2_activated INTEGER NOT NULL DEFAULT 0,
             entry2_activated_ts INTEGER,
-            entry2_activated_price REAL
+            entry2_activated_price REAL,
+            tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
+            reporting_expired INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -148,6 +155,8 @@ def connect_db():
         "ALTER TABLE signals ADD COLUMN entry2_activated INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN entry2_activated_ts INTEGER",
         "ALTER TABLE signals ADD COLUMN entry2_activated_price REAL",
+        "ALTER TABLE signals ADD COLUMN tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN reporting_expired INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(sql)
@@ -160,16 +169,6 @@ def connect_db():
             v TEXT NOT NULL
         )
     """)
-
-    # Lease lock table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS bot_lock (
-            k TEXT PRIMARY KEY,
-            owner TEXT NOT NULL,
-            lease_until INTEGER NOT NULL
-        )
-    """)
-
     conn.commit()
     return conn
 
@@ -204,46 +203,6 @@ def save_signal(conn, source_message_id: int, s: dict):
         return cur.lastrowid
     except sqlite3.IntegrityError:
         return None
-
-# =========================
-# LEASE LOCK
-# =========================
-def lock_try_acquire(conn, lease_sec: int):
-    now = int(time.time())
-    lease_until = now + lease_sec
-    conn.execute("BEGIN IMMEDIATE;")
-    row = conn.execute("SELECT owner, lease_until FROM bot_lock WHERE k='poller'").fetchone()
-    if row and row[1] > now and row[0] != INSTANCE_ID:
-        conn.execute("COMMIT;")
-        return False
-    conn.execute("""
-        INSERT INTO bot_lock(k, owner, lease_until)
-        VALUES('poller', ?, ?)
-        ON CONFLICT(k) DO UPDATE SET owner=excluded.owner, lease_until=excluded.lease_until
-    """, (INSTANCE_ID, lease_until))
-    conn.execute("COMMIT;")
-    return True
-
-def lock_heartbeat(conn, lease_sec: int):
-    now = int(time.time())
-    cur = conn.execute("""
-        UPDATE bot_lock SET lease_until=?
-        WHERE k='poller' AND owner=?
-    """, (now + lease_sec, INSTANCE_ID))
-    conn.commit()
-    return cur.rowcount == 1
-
-async def heartbeat_task(conn):
-    while True:
-        ok = False
-        try:
-            ok = lock_heartbeat(conn, LOCK_LEASE_SEC)
-        except Exception as e:
-            log(f"lock heartbeat error: {e}")
-        if not ok:
-            log("LOCK LOST -> stopping (another instance owns the lock).")
-            os._exit(0)
-        await asyncio.sleep(LOCK_HEARTBEAT_SEC)
 
 # =========================
 # TELEGRAM SEND
@@ -342,12 +301,20 @@ def extract_posts(updates):
     return max_update_id, posts
 
 # =========================
-# MONITOR (ACTIVATE + ENTRY2 + TP HITS)
+# MONITOR
 # =========================
 def in_range(price, low, high):
     if price is None or low is None or high is None:
         return False
     return low <= price <= high
+
+def is_reporting_active(now_ts: int, activated_ts: int | None):
+    if not activated_ts:
+        return False
+    return now_ts <= activated_ts + REPORTING_ACTIVE_DAYS * 86400
+
+def is_activation_valid(now_ts: int, created_ts: int):
+    return now_ts <= created_ts + ACTIVATION_VALID_DAYS * 86400
 
 async def monitor_prices(bot: Bot, conn):
     log("monitor_prices() started")
@@ -357,14 +324,30 @@ async def monitor_prices(bot: Bot, conn):
                 """SELECT
                     id, symbol, side, mode,
                     entry1_low, entry1_high, entry2_low, entry2_high,
-                    tps_json, activated, activated_price, tp_hits,
-                    entry2_activated, entry2_activated_price
+                    tps_json, created_ts,
+                    activated, activated_ts, activated_price, tp_hits,
+                    entry2_activated, entry2_activated_price,
+                    tp1_rehit_after_entry2_sent, reporting_expired
                    FROM signals"""
             ).fetchall()
 
             log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
-            for (sid, symbol, side, mode, e1l, e1h, e2l, e2h, tps_json, activated, activated_price, tp_hits, e2_activated, e2_activated_price) in rows:
+            now_ts = int(time.time())
+
+            for (
+                sid, symbol, side, mode,
+                e1l, e1h, e2l, e2h,
+                tps_json, created_ts,
+                activated, activated_ts, activated_price, tp_hits,
+                e2_activated, e2_activated_price,
+                tp1_rehit_sent, reporting_expired
+            ) in rows:
+
+                # If already marked expired, skip
+                if reporting_expired:
+                    continue
+
                 price = await get_price(symbol)
                 log(f"check sid={sid} {symbol} {side} mode={mode} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits} e2_activated={e2_activated}")
 
@@ -373,22 +356,28 @@ async def monitor_prices(bot: Bot, conn):
 
                 tps = json.loads(tps_json)
 
-                # WAIT activation (Entry1 OR Entry2)
+                # 1) Activation validity (created_ts + 30d) affects activation for WAIT
                 if not activated and mode == "WAIT":
+                    if not is_activation_valid(now_ts, created_ts):
+                        # Signal is too old to activate
+                        continue
+
                     in_e1 = in_range(price, e1l, e1h)
                     in_e2 = (not in_e1) and in_range(price, e2l, e2h)
                     if in_e1 or in_e2:
                         conn.execute(
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                            (int(time.time()), price, sid)
+                            (now_ts, price, sid)
                         )
+                        # If activated directly in entry2 zone, mark entry2 as active too (still within 30d)
                         if in_e2 and e2l is not None and e2h is not None:
                             conn.execute(
                                 "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
-                                (int(time.time()), price, sid)
+                                (now_ts, price, sid)
                             )
                             e2_activated = 1
                             e2_activated_price = price
+
                         conn.commit()
                         await post_target(bot,
                             "✅ Signál aktivován\n"
@@ -398,12 +387,33 @@ async def monitor_prices(bot: Bot, conn):
                         )
                     continue
 
-                # AFTER ACTIVATION: watch Entry2 zone (MARKET + WAIT)
+                # After activation: enforce reporting window (activated_ts + 60d)
+                if activated:
+                    if not is_reporting_active(now_ts, activated_ts):
+                        conn.execute("UPDATE signals SET reporting_expired=1 WHERE id=?", (sid,))
+                        conn.commit()
+                        continue
+
+                # Determine entry1_price for performance/TP calculations
+                if activated:
+                    entry1_price = activated_price if activated_price is not None else price
+                    if entry1_price is None or entry1_price == 0:
+                        entry1_price = price
+                else:
+                    entry1_price = None
+
+                # Compute current performance from entry1 (used to disable entry2 after +18%)
+                perf_from_e1 = 0.0
+                if activated and entry1_price:
+                    perf_from_e1 = pct_from_entry(price, entry1_price, side)
+
+                # 2) Entry2 activation rules (after activation): only if within 30d from created_ts and perf < 18%
                 if activated and (not e2_activated) and (e2l is not None) and (e2h is not None):
-                    if in_range(price, e2l, e2h):
+                    entry2_allowed = is_activation_valid(now_ts, created_ts) and (perf_from_e1 < ENTRY2_DISABLE_PROFIT_PCT)
+                    if entry2_allowed and in_range(price, e2l, e2h):
                         conn.execute(
                             "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
-                            (int(time.time()), price, sid)
+                            (now_ts, price, sid)
                         )
                         conn.commit()
                         e2_activated = 1
@@ -415,11 +425,32 @@ async def monitor_prices(bot: Bot, conn):
                             f"Entry2 zóna: {fmt(e2l)} - {fmt(e2h)}"
                         )
 
-                # TP hits
+                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
+                # Condition: TP1 already hit earlier (tp_hits >= 1) AND entry2 activated AND not sent yet
+                if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
+                    tp1 = float(tps[0])
+                    tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
+                    if tp1_is_hit_now:
+                        entry2_price = e2_activated_price if e2_activated_price else None
+                        if entry2_price:
+                            g2_spot = pct_from_entry(tp1, entry2_price, side)
+                            g2_lev = g2_spot * LEVERAGE
+                            await post_target(bot,
+                                f"🎯 {symbol} – TP1 HIT (po aktivaci 2. Entry)\n"
+                                f"Směr: {side}\n"
+                                f"Entry2: {fmt(entry2_price)}\n"
+                                f"TP1: {fmt(tp1)}\n"
+                                f"Zisk: {g2_spot:.2f}% čistého trhu ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
+                            )
+                        conn.execute(
+                            "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
+                            (sid,)
+                        )
+                        conn.commit()
+                        tp1_rehit_sent = 1
+
+                # 4) Normal TP hits (only after activation, within reporting window)
                 if activated:
-                    entry1_price = activated_price if activated_price is not None else price
-                    if entry1_price is None or entry1_price == 0:
-                        entry1_price = price
                     entry2_price = e2_activated_price if e2_activated else None
 
                     while tp_hits < len(tps):
@@ -464,25 +495,11 @@ async def monitor_prices(bot: Bot, conn):
 # =========================
 async def main_async():
     log("START: main_async entered")
-    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} LEVERAGE={LEVERAGE:g} INSTANCE={INSTANCE_ID}")
+    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} LEVERAGE={LEVERAGE:g}")
+    log(f"RULES: activation_valid_days={ACTIVATION_VALID_DAYS} reporting_active_days={REPORTING_ACTIVE_DAYS} entry2_disable_profit_pct={ENTRY2_DISABLE_PROFIT_PCT:g}")
 
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
-
-    # Acquire lock (hard gate)
-    if not lock_try_acquire(conn, LOCK_LEASE_SEC):
-        log("LOCK NOT ACQUIRED -> another instance is running. Sleeping forever.")
-        while True:
-            await asyncio.sleep(60)
-
-    # Start heartbeat (if we lose the lock, exit)
-    asyncio.create_task(heartbeat_task(conn))
-
-    # Optional: ensure webhook is cleared (cheap safety)
-    try:
-        requests.post(f"{TG_API}/setWebhook", data={"url": ""}, timeout=10)
-    except Exception:
-        pass
 
     # Anti-spam ping 1x/24h
     now = int(time.time())
@@ -499,13 +516,12 @@ async def main_async():
             status, updates = await asyncio.to_thread(tg_get_updates, offset + 1, 20)
 
             if status == "conflict":
-                # With the lock in place, this should stop happening.
-                log("getUpdates Conflict (unexpected with lock) -> sleeping 10s")
-                await asyncio.sleep(10)
+                log("getUpdates Conflict -> sleeping 60s to yield to other poller")
+                await asyncio.sleep(60)
                 continue
 
             if status == "unauthorized":
-                log("FATAL: Unauthorized token. Fix BOT_TOKEN in Render env.")
+                log("FATAL: Unauthorized token. Fix BOT_TOKEN in env.")
                 await asyncio.sleep(10)
                 continue
 
@@ -554,9 +570,10 @@ async def main_async():
                     if price_now is None:
                         log(f"MARKET activate: price None for {s['symbol']} (skip)")
                     else:
+                        now_ts = int(time.time())
                         conn.execute(
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                            (int(time.time()), price_now, sid)
+                            (now_ts, price_now, sid)
                         )
                         conn.commit()
                         await post_target(bot,
