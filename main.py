@@ -1,7 +1,11 @@
-import os, re, time, json, sqlite3, asyncio, socket
+import os, re, time, json, sqlite3, asyncio, socket, base64
 import requests
 from telegram import Bot
 from telegram.error import TelegramError
+
+# Google Sheets
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 # =========================
 # CONFIG
@@ -22,19 +26,26 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 
 # RULES
-ACTIVATION_VALID_DAYS = int(os.getenv("ACTIVATION_VALID_DAYS", "30"))   # valid for 1EP/2EP activation from created_ts
-REPORTING_ACTIVE_DAYS = int(os.getenv("REPORTING_ACTIVE_DAYS", "60"))   # report max N days from activated_ts
-ENTRY2_DISABLE_PROFIT_PCT = float(os.getenv("ENTRY2_DISABLE_PROFIT_PCT", "15"))  # CHANGED: disable entry2 if perf >= N%
+ACTIVATION_VALID_DAYS = int(os.getenv("ACTIVATION_VALID_DAYS", "30"))
+REPORTING_ACTIVE_DAYS = int(os.getenv("REPORTING_ACTIVE_DAYS", "60"))
+ENTRY2_DISABLE_PROFIT_PCT = float(os.getenv("ENTRY2_DISABLE_PROFIT_PCT", "15"))
 
-# INSTANCE LOCK (prevents Telegram getUpdates Conflict + duplicate reporting)
-LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "90"))              # lease time
-LOCK_RENEW_EVERY_SEC = int(os.getenv("LOCK_RENEW_EVERY_SEC", "30"))  # renew cadence
+# INSTANCE LOCK
+LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "90"))
+LOCK_RENEW_EVERY_SEC = int(os.getenv("LOCK_RENEW_EVERY_SEC", "30"))
 INSTANCE_ID = os.getenv("INSTANCE_ID", "").strip()
 if not INSTANCE_ID:
     INSTANCE_ID = f"{socket.gethostname()}-pid{os.getpid()}"
 
-# Telegram raw API
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Google Sheets ENV
+GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+GSHEET_SIGNALS_TAB = os.getenv("GSHEET_SIGNALS_TAB", "Signals").strip()
+GSHEET_PROFITS_TAB = os.getenv("GSHEET_PROFITS_TAB", "Profits").strip()
+GOOGLE_CREDS_JSON_B64 = os.getenv("GOOGLE_CREDS_JSON_B64", "").strip()
+
+GSHEETS_ENABLED = bool(GSHEET_ID and GOOGLE_CREDS_JSON_B64)
 
 # =========================
 # PARSING
@@ -110,7 +121,6 @@ def parse_signal(text: str):
     if not tps:
         return None
 
-    # LONG: asc, SHORT: desc
     tps = sorted(tps, reverse=(side == "SHORT"))
 
     return {
@@ -154,7 +164,8 @@ def connect_db():
             entry2_activated_price REAL,
             tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
             avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
-            reporting_expired INTEGER NOT NULL DEFAULT 0
+            reporting_expired INTEGER NOT NULL DEFAULT 0,
+            sheet_row INTEGER
         )
     """)
 
@@ -166,6 +177,7 @@ def connect_db():
         "ALTER TABLE signals ADD COLUMN tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN reporting_expired INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN sheet_row INTEGER",
     ]:
         try:
             conn.execute(sql)
@@ -214,7 +226,184 @@ def save_signal(conn, source_message_id: int, s: dict):
         return None
 
 # =========================
-# INSTANCE LOCK (SQLite lease)
+# GOOGLE SHEETS
+# =========================
+SIGNALS_HEADERS = [
+    "SignalID", "SourceMessageID",
+    "CreatedTS", "Symbol", "Side", "Mode",
+    "Entry1Low", "Entry1High", "Entry2Low", "Entry2High",
+    "TPCount", "TPsJson",
+    "Status",
+    "Activated", "ActivatedTS", "ActivatedPrice",
+    "Entry2Activated", "Entry2ActivatedTS", "Entry2ActivatedPrice",
+    "TPHits",
+    "ReportingExpired"
+]
+
+PROFITS_HEADERS = [
+    "EventTS", "SignalID", "Symbol", "Side",
+    "TPIndex", "TPPrice",
+    "Entry1Price", "ProfitSpotPct_E1", "ProfitLevPct_E1",
+    "Entry2Price", "ProfitSpotPct_E2", "ProfitLevPct_E2",
+    "Note"
+]
+
+def _gsheets_build():
+    creds_json = base64.b64decode(GOOGLE_CREDS_JSON_B64.encode("utf-8")).decode("utf-8")
+    info = json.loads(creds_json)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+def _ensure_headers(service):
+    # Signals
+    for tab_name, headers in [(GSHEET_SIGNALS_TAB, SIGNALS_HEADERS), (GSHEET_PROFITS_TAB, PROFITS_HEADERS)]:
+        rng = f"{tab_name}!A1:Z1"
+        resp = service.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=rng).execute()
+        values = resp.get("values", [])
+        if not values or values[0] != headers:
+            service.spreadsheets().values().update(
+                spreadsheetId=GSHEET_ID,
+                range=f"{tab_name}!A1",
+                valueInputOption="RAW",
+                body={"values": [headers]}
+            ).execute()
+
+def _append_row(service, tab_name: str, row: list):
+    resp = service.spreadsheets().values().append(
+        spreadsheetId=GSHEET_ID,
+        range=f"{tab_name}!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]}
+    ).execute()
+
+    # updatedRange like 'Signals!A3:U3'
+    updated_range = resp.get("updates", {}).get("updatedRange", "")
+    m = re.search(r"!A(\d+):", updated_range)
+    row_num = int(m.group(1)) if m else None
+    return row_num
+
+def _update_row(service, tab_name: str, row_num: int, row: list):
+    rng = f"{tab_name}!A{row_num}"
+    service.spreadsheets().values().update(
+        spreadsheetId=GSHEET_ID,
+        range=rng,
+        valueInputOption="RAW",
+        body={"values": [row]}
+    ).execute()
+
+def build_signals_row(db_row: dict):
+    # Status derivation
+    if db_row["reporting_expired"]:
+        status = "EXPIRED"
+    elif db_row["activated"] and db_row["tp_hits"] >= db_row["tp_count"]:
+        status = "DONE"
+    elif db_row["entry2_activated"]:
+        status = "ENTRY2"
+    elif db_row["activated"]:
+        status = "ACTIVE"
+    else:
+        status = "NEW"
+
+    return [
+        db_row["id"], db_row["source_message_id"],
+        db_row["created_ts"], db_row["symbol"], db_row["side"], db_row["mode"],
+        db_row["entry1_low"], db_row["entry1_high"], db_row["entry2_low"], db_row["entry2_high"],
+        db_row["tp_count"], db_row["tps_json"],
+        status,
+        db_row["activated"], db_row["activated_ts"], db_row["activated_price"],
+        db_row["entry2_activated"], db_row["entry2_activated_ts"], db_row["entry2_activated_price"],
+        db_row["tp_hits"],
+        db_row["reporting_expired"]
+    ]
+
+async def gsheets_init_once(state):
+    if not GSHEETS_ENABLED:
+        return None
+    if state.get("service"):
+        return state["service"]
+    try:
+        service = await asyncio.to_thread(_gsheets_build)
+        await asyncio.to_thread(_ensure_headers, service)
+        state["service"] = service
+        log(f"GSHEETS: enabled spreadsheet={GSHEET_ID} tabs=({GSHEET_SIGNALS_TAB},{GSHEET_PROFITS_TAB})")
+        return service
+    except Exception as e:
+        log(f"GSHEETS init error: {e}")
+        return None
+
+async def gsheets_upsert_signal(service, conn, sid: int):
+    if not service:
+        return
+
+    row = conn.execute(
+        """SELECT
+            id, source_message_id, created_ts, symbol, side, mode,
+            entry1_low, entry1_high, entry2_low, entry2_high,
+            tps_json, tp_hits, activated, activated_ts, activated_price,
+            entry2_activated, entry2_activated_ts, entry2_activated_price,
+            reporting_expired, sheet_row
+        FROM signals WHERE id=?""",
+        (sid,)
+    ).fetchone()
+
+    if not row:
+        return
+
+    (id_, source_message_id, created_ts, symbol, side, mode,
+     entry1_low, entry1_high, entry2_low, entry2_high,
+     tps_json, tp_hits, activated, activated_ts, activated_price,
+     entry2_activated, entry2_activated_ts, entry2_activated_price,
+     reporting_expired, sheet_row) = row
+
+    tp_count = len(json.loads(tps_json))
+    db_row = {
+        "id": id_,
+        "source_message_id": source_message_id,
+        "created_ts": created_ts,
+        "symbol": symbol,
+        "side": side,
+        "mode": mode,
+        "entry1_low": entry1_low,
+        "entry1_high": entry1_high,
+        "entry2_low": entry2_low,
+        "entry2_high": entry2_high,
+        "tp_count": tp_count,
+        "tps_json": tps_json,
+        "tp_hits": tp_hits,
+        "activated": activated,
+        "activated_ts": activated_ts,
+        "activated_price": activated_price,
+        "entry2_activated": entry2_activated,
+        "entry2_activated_ts": entry2_activated_ts,
+        "entry2_activated_price": entry2_activated_price,
+        "reporting_expired": reporting_expired
+    }
+
+    out_row = build_signals_row(db_row)
+
+    try:
+        if sheet_row and int(sheet_row) > 1:
+            await asyncio.to_thread(_update_row, service, GSHEET_SIGNALS_TAB, int(sheet_row), out_row)
+        else:
+            new_row_num = await asyncio.to_thread(_append_row, service, GSHEET_SIGNALS_TAB, out_row)
+            if new_row_num:
+                conn.execute("UPDATE signals SET sheet_row=? WHERE id=?", (int(new_row_num), sid))
+                conn.commit()
+    except Exception as e:
+        log(f"GSHEETS upsert signal error sid={sid}: {e}")
+
+async def gsheets_append_profit(service, profit_row: list):
+    if not service:
+        return
+    try:
+        await asyncio.to_thread(_append_row, service, GSHEET_PROFITS_TAB, profit_row)
+    except Exception as e:
+        log(f"GSHEETS append profit error: {e}")
+
+# =========================
+# INSTANCE LOCK
 # =========================
 _LOCK_OWNER_KEY = "instance_lock_owner"
 _LOCK_UNTIL_KEY = "instance_lock_until"
@@ -370,7 +559,7 @@ def in_range(price, low, high):
         return False
     return low <= price <= high
 
-def is_reporting_active(now_ts: int, activated_ts: int | None):
+def is_reporting_active(now_ts: int, activated_ts):
     if not activated_ts:
         return False
     return now_ts <= activated_ts + REPORTING_ACTIVE_DAYS * 86400
@@ -378,8 +567,10 @@ def is_reporting_active(now_ts: int, activated_ts: int | None):
 def is_activation_valid(now_ts: int, created_ts: int):
     return now_ts <= created_ts + ACTIVATION_VALID_DAYS * 86400
 
-async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
+async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event, gs_state: dict):
     log("monitor_prices() started")
+    service = await gsheets_init_once(gs_state)
+
     while not stop_event.is_set():
         try:
             rows = conn.execute(
@@ -388,14 +579,12 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                     entry1_low, entry1_high, entry2_low, entry2_high,
                     tps_json, created_ts,
                     activated, activated_ts, activated_price, tp_hits,
-                    entry2_activated, entry2_activated_price,
+                    entry2_activated, entry2_activated_ts, entry2_activated_price,
                     tp1_rehit_after_entry2_sent,
                     avg_reached_after_entry2_sent,
                     reporting_expired
                    FROM signals"""
             ).fetchall()
-
-            log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
             now_ts = int(time.time())
 
@@ -404,7 +593,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                 e1l, e1h, e2l, e2h,
                 tps_json, created_ts,
                 activated, activated_ts, activated_price, tp_hits,
-                e2_activated, e2_activated_price,
+                e2_activated, e2_activated_ts, e2_activated_price,
                 tp1_rehit_sent,
                 avg_reached_sent,
                 reporting_expired
@@ -417,7 +606,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                     continue
 
                 price = await get_price(symbol)
-                log(f"check sid={sid} {symbol} {side} mode={mode} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits} e2_activated={e2_activated}")
+                log(f"check sid={sid} {symbol} {side} mode={mode} price={price} activated={activated} tp_hits={tp_hits} e2_activated={e2_activated}")
 
                 if price is None:
                     continue
@@ -436,15 +625,21 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
                             (now_ts, price, sid)
                         )
+
                         if in_e2 and e2l is not None and e2h is not None:
                             conn.execute(
                                 "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
-                                (now_ts, price, sid)
+                                (now_ts, now_ts, price, sid)
                             )
                             e2_activated = 1
                             e2_activated_price = price
+                            e2_activated_ts = now_ts
 
                         conn.commit()
+
+                        # Sheets update
+                        await gsheets_upsert_signal(service, conn, sid)
+
                         await post_target(bot,
                             "✅ Signál aktivován\n"
                             f"{symbol} ({side})\n"
@@ -453,14 +648,15 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                         )
                     continue
 
-                # After activation: enforce reporting window (activated_ts + 60d)
+                # After activation: enforce reporting window
                 if activated:
                     if not is_reporting_active(now_ts, activated_ts):
                         conn.execute("UPDATE signals SET reporting_expired=1 WHERE id=?", (sid,))
                         conn.commit()
+                        await gsheets_upsert_signal(service, conn, sid)
                         continue
 
-                # Entry1 price for existing profit logic (DO NOT CHANGE)
+                # Entry1 price (existing logic)
                 if activated:
                     entry1_price = activated_price if activated_price is not None else price
                     if entry1_price is None or entry1_price == 0:
@@ -468,22 +664,26 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                 else:
                     entry1_price = None
 
-                # Current performance from entry1 (used to disable entry2 after +15%)
+                # perf from entry1
                 perf_from_e1 = 0.0
                 if activated and entry1_price:
                     perf_from_e1 = pct_from_entry(price, entry1_price, side)
 
-                # 2) Entry2 activation rules (within 30d and perf < 15%)
+                # 2) Entry2 activation rules
                 if activated and (not e2_activated) and (e2l is not None) and (e2h is not None):
                     entry2_allowed = is_activation_valid(now_ts, created_ts) and (perf_from_e1 < ENTRY2_DISABLE_PROFIT_PCT)
                     if entry2_allowed and in_range(price, e2l, e2h):
                         conn.execute(
                             "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
-                            (now_ts, price, sid)
+                            (now_ts, now_ts, price, sid)
                         )
                         conn.commit()
                         e2_activated = 1
                         e2_activated_price = price
+                        e2_activated_ts = now_ts
+
+                        await gsheets_upsert_signal(service, conn, sid)
+
                         await post_target(bot,
                             "📌 Entry2 aktivována (čekací zóna)\n"
                             f"{symbol} ({side})\n"
@@ -491,7 +691,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                             f"Entry2 zóna: {fmt(e2l)} - {fmt(e2h)}"
                         )
 
-                # 2.5) AVG (Entry1+Entry2) reached report (INFO ONLY, no profit logic changes)
+                # 2.5) AVG reached info
                 if activated and e2_activated and (avg_reached_sent == 0):
                     if entry1_price and e2_activated_price and e2_activated_price != 0:
                         avg_price = (float(entry1_price) + float(e2_activated_price)) / 2.0
@@ -506,14 +706,11 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                                 f"Zprůměrovaná cena: {fmt(avg_price)}\n"
                                 f"Aktuální cena: {fmt(price)}"
                             )
-                            conn.execute(
-                                "UPDATE signals SET avg_reached_after_entry2_sent=1 WHERE id=?",
-                                (sid,)
-                            )
+                            conn.execute("UPDATE signals SET avg_reached_after_entry2_sent=1 WHERE id=?", (sid,))
                             conn.commit()
                             avg_reached_sent = 1
 
-                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE) - keeps existing logic
+                # 3) TP1 re-hit after Entry2 (profit-only msg, keep)
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
                     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
@@ -529,14 +726,11 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                                 f"TP1: {fmt(tp1)}\n"
                                 f"Zisk: {g2_spot:.2f}% čistého trhu ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
                             )
-                        conn.execute(
-                            "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
-                            (sid,)
-                        )
+                        conn.execute("UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?", (sid,))
                         conn.commit()
                         tp1_rehit_sent = 1
 
-                # 4) Normal TP hits (existing logic unchanged)
+                # 4) Normal TP hits + Sheets append to Profits
                 if activated:
                     entry2_price = e2_activated_price if e2_activated else None
 
@@ -553,6 +747,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                         g1_spot = pct_from_entry(tp, entry1_price, side)
                         g1_lev = g1_spot * LEVERAGE
 
+                        note = ""
                         if entry2_price is not None and entry2_price != 0:
                             g2_spot = pct_from_entry(tp, entry2_price, side)
                             g2_lev = g2_spot * LEVERAGE
@@ -561,16 +756,32 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                                 f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
                             )
                         else:
+                            g2_spot = ""
+                            g2_lev = ""
+                            entry2_price = ""
                             profit_line = f"Zisk: {g1_spot:.2f}% čistého trhu ({g1_lev:.2f}% s pákou {LEVERAGE:g}x)"
 
                         await post_target(bot,
                             f"🎯 {symbol} – TP{tp_hits} HIT\n"
                             f"Směr: {side}\n"
                             f"Entry1: {fmt(entry1_price)}\n"
-                            f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
+                            f"{'Entry2: ' + fmt(e2_activated_price) if e2_activated else 'Entry2: -'}\n"
                             f"TP{tp_hits}: {fmt(tp)}\n"
                             f"{profit_line}"
                         )
+
+                        # Sheets: update signal + append profit event
+                        await gsheets_upsert_signal(service, conn, sid)
+
+                        profit_row = [
+                            int(time.time()), sid, symbol, side,
+                            tp_hits, tp,
+                            entry1_price, round(g1_spot, 6), round(g1_lev, 6),
+                            (e2_activated_price if e2_activated else ""), (round(pct_from_entry(tp, e2_activated_price, side), 6) if e2_activated else ""),
+                            (round(pct_from_entry(tp, e2_activated_price, side) * LEVERAGE, 6) if e2_activated else ""),
+                            note
+                        ]
+                        await gsheets_append_profit(service, profit_row)
 
         except Exception as e:
             log(f"monitor_prices loop error: {e}")
@@ -595,8 +806,15 @@ async def main_async():
     log(f"RULES: activation_valid_days={ACTIVATION_VALID_DAYS} reporting_active_days={REPORTING_ACTIVE_DAYS} entry2_disable_profit_pct={ENTRY2_DISABLE_PROFIT_PCT:g}")
     log(f"LOCK: ttl={LOCK_TTL_SEC}s renew_every={LOCK_RENEW_EVERY_SEC}s")
 
+    if GSHEETS_ENABLED:
+        log(f"GSHEETS: env detected (id={GSHEET_ID} tabs={GSHEET_SIGNALS_TAB},{GSHEET_PROFITS_TAB})")
+    else:
+        log("GSHEETS: disabled (missing env vars)")
+
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
+
+    gs_state = {}  # holds google sheets service
 
     # Leader election loop
     while True:
@@ -611,7 +829,7 @@ async def main_async():
         stop_event = asyncio.Event()
         renew_task = asyncio.create_task(lock_renew_loop(conn, stop_event))
 
-        # Anti-spam ping 1x/24h (leader only)
+        # leader ping 1x/24h
         try:
             now = int(time.time())
             last_ping = int(state_get(conn, "startup_ping_ts", "0"))
@@ -622,7 +840,7 @@ async def main_async():
             log(f"startup ping error: {e}")
 
         offset = int(state_get(conn, "raw_offset", "0"))
-        monitor_task = asyncio.create_task(monitor_prices(bot, conn, stop_event))
+        monitor_task = asyncio.create_task(monitor_prices(bot, conn, stop_event, gs_state))
 
         try:
             while not stop_event.is_set():
@@ -678,9 +896,13 @@ async def main_async():
                         f"TPs (rezistenční úrovně): {len(s['tps'])}"
                     )
 
-                    log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
+                    # Sheets: upsert NEW
+                    service = await gsheets_init_once(gs_state)
+                    await gsheets_upsert_signal(service, conn, sid)
 
-                    # MARKET => activate immediately (Entry1 = activation price)
+                    log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']}")
+
+                    # MARKET => activate immediately
                     if s["mode"] == "MARKET":
                         price_now = await get_price(s["symbol"])
                         if price_now is None:
@@ -689,9 +911,12 @@ async def main_async():
                             now_ts = int(time.time())
                             conn.execute(
                                 "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                                (now_ts, price_now, sid)
+                                (now_ts, now_ts, price_now, sid)
                             )
                             conn.commit()
+
+                            await gsheets_upsert_signal(service, conn, sid)
+
                             await post_target(bot,
                                 "✅ Signál aktivován (MARKET)\n"
                                 f"{s['symbol']} ({s['side']})\n"
