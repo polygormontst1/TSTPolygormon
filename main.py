@@ -13,6 +13,8 @@ from googleapiclient.discovery import build
 def log(msg: str):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
+log("VERSION: GSHEETS_BUILD_001")
+
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"].strip())
@@ -944,3 +946,4 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
