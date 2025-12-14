@@ -23,7 +23,7 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 INSTANCE_ID = os.getenv("INSTANCE_ID", str(uuid.uuid4())[:8])
 LOCK_KEY_OWNER = "poll_lock_owner"
 LOCK_KEY_TS = "poll_lock_ts"
-LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "45"))   # jak dlouho je lock platný bez refresh
+LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "45"))
 LOCK_REFRESH_SEC = int(os.getenv("LOCK_REFRESH_SEC", "10"))
 
 # =========================
@@ -62,11 +62,11 @@ def parse_signal(text: str):
 
     base = m.group(1).upper()
     quote = m.group(2).upper()
-    action = (m.group(3) or "").lower()
+    action = (m.group(3) or "").lower()  # long/short/buy/sell
     has_on = (m.group(4) or "").lower() == "on"
     symbol = f"{base}{quote}"
 
-    # Tvoje pravidla:
+    # TVOJE pravidla:
     # - Long / Short => MARKET (aktivace ihned)
     # - Buy on / Short on => WAIT (čeká na entry)
     if action == "long":
@@ -74,13 +74,13 @@ def parse_signal(text: str):
         mode = "MARKET"
     elif action == "short":
         side = "SHORT"
-        mode = "WAIT" if has_on else "MARKET"
+        mode = "WAIT" if has_on else "MARKET"   # "Short on" => WAIT, "Short" => MARKET
     elif action == "buy":
         side = "LONG"
-        mode = "WAIT"
+        mode = "WAIT"  # "Buy on" => WAIT (povolené i když někdo napíše jen "Buy")
     elif action == "sell":
         side = "SHORT"
-        mode = "WAIT"
+        mode = "WAIT"  # "Sell on" => WAIT
     else:
         return None
 
@@ -150,6 +150,7 @@ def connect_db():
         )
     """)
 
+    # migrace pro staré DB
     try:
         conn.execute("ALTER TABLE signals ADD COLUMN mode TEXT NOT NULL DEFAULT 'WAIT'")
         conn.commit()
@@ -239,28 +240,24 @@ def try_acquire_lock(conn) -> bool:
     owner = state_get(conn, LOCK_KEY_OWNER, "")
     ts = int(state_get(conn, LOCK_KEY_TS, "0"))
 
-    # lock volný / lock prošlý
     if (not owner) or (now - ts > LOCK_TTL_SEC):
         state_set(conn, LOCK_KEY_OWNER, INSTANCE_ID)
         state_set(conn, LOCK_KEY_TS, str(now))
         log(f"LOCK ACQUIRED owner={INSTANCE_ID} (prev_owner={owner or '-'} age={now-ts}s)")
         return True
 
-    # lock držíme my
     if owner == INSTANCE_ID:
         state_set(conn, LOCK_KEY_TS, str(now))
         return True
 
-    # lock drží někdo jiný
     log(f"LOCK BUSY owner={owner} age={now-ts}s (me={INSTANCE_ID})")
     return False
 
 def refresh_lock(conn) -> bool:
-    now = int(time.time())
     owner = state_get(conn, LOCK_KEY_OWNER, "")
     if owner != INSTANCE_ID:
         return False
-    state_set(conn, LOCK_KEY_TS, str(now))
+    state_set(conn, LOCK_KEY_TS, str(int(time.time())))
     return True
 
 # =========================
@@ -369,14 +366,23 @@ async def main_async():
     log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} INSTANCE={INSTANCE_ID}")
 
     bot = Bot(token=BOT_TOKEN)
+
+    # ✅ SANITY CHECK TOKEN (tohle ti přesně ukáže, jakého bota Render používá)
+    try:
+        me = await bot.get_me()
+        log(f"BOT OK: @{me.username} id={me.id}")
+    except TelegramError as e:
+        log(f"BOT TOKEN ERROR: {repr(e)}")
+        return
+
     conn = connect_db()
 
-    # acquire lock or exit
+    # Acquire lock or exit
     if not try_acquire_lock(conn):
         log("EXIT: another instance holds the lock. (prevents getUpdates Conflict)")
         return
 
-    # startup ping 1x/24h
+    # Startup ping 1x/24h
     now = int(time.time())
     last_ping = int(state_get(conn, "startup_ping_ts", "0"))
     if now - last_ping > 24 * 3600:
@@ -384,10 +390,8 @@ async def main_async():
         state_set(conn, "startup_ping_ts", str(now))
 
     last_update_id = int(state_get(conn, "last_update_id", "0"))
-
     monitor_task = asyncio.create_task(monitor_prices(bot, conn))
-
-    last_lock_refresh = 0
+    last_lock_refresh = 0.0
 
     try:
         while True:
