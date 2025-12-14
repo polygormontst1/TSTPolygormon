@@ -24,7 +24,7 @@ LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 # RULES
 ACTIVATION_VALID_DAYS = int(os.getenv("ACTIVATION_VALID_DAYS", "30"))   # valid for 1EP/2EP activation from created_ts
 REPORTING_ACTIVE_DAYS = int(os.getenv("REPORTING_ACTIVE_DAYS", "60"))   # report max N days from activated_ts
-ENTRY2_DISABLE_PROFIT_PCT = float(os.getenv("ENTRY2_DISABLE_PROFIT_PCT", "18"))  # disable entry2 if perf >= N%
+ENTRY2_DISABLE_PROFIT_PCT = float(os.getenv("ENTRY2_DISABLE_PROFIT_PCT", "15"))  # CHANGED: disable entry2 if perf >= N%
 
 # INSTANCE LOCK (prevents Telegram getUpdates Conflict + duplicate reporting)
 LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "90"))              # lease time
@@ -153,6 +153,7 @@ def connect_db():
             entry2_activated_ts INTEGER,
             entry2_activated_price REAL,
             tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
+            avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
             reporting_expired INTEGER NOT NULL DEFAULT 0
         )
     """)
@@ -163,6 +164,7 @@ def connect_db():
         "ALTER TABLE signals ADD COLUMN entry2_activated_ts INTEGER",
         "ALTER TABLE signals ADD COLUMN entry2_activated_price REAL",
         "ALTER TABLE signals ADD COLUMN tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN reporting_expired INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
@@ -218,13 +220,8 @@ _LOCK_OWNER_KEY = "instance_lock_owner"
 _LOCK_UNTIL_KEY = "instance_lock_until"
 
 def _try_acquire_lock_sync(conn, owner: str, ttl_sec: int) -> bool:
-    """
-    Acquire or renew a lease-style lock in the `state` table.
-    Single writer wins via BEGIN IMMEDIATE.
-    """
     now = int(time.time())
     until = now + ttl_sec
-
     try:
         conn.execute("BEGIN IMMEDIATE;")
         cur_owner = conn.execute("SELECT v FROM state WHERE k=?", (_LOCK_OWNER_KEY,)).fetchone()
@@ -233,7 +230,6 @@ def _try_acquire_lock_sync(conn, owner: str, ttl_sec: int) -> bool:
         cur_owner = cur_owner[0] if cur_owner else ""
         cur_until = int(cur_until[0]) if cur_until and cur_until[0].isdigit() else 0
 
-        # Lock free/expired OR we already own it
         if (cur_until <= now) or (cur_owner == owner) or (cur_owner == ""):
             conn.execute(
                 "INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -260,7 +256,6 @@ async def acquire_lock(conn, owner: str) -> bool:
     return await asyncio.to_thread(_try_acquire_lock_sync, conn, owner, LOCK_TTL_SEC)
 
 async def renew_lock(conn, owner: str) -> bool:
-    # renewal is the same operation (we keep ownership)
     return await asyncio.to_thread(_try_acquire_lock_sync, conn, owner, LOCK_TTL_SEC)
 
 def lock_status_str(conn) -> str:
@@ -394,7 +389,9 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                     tps_json, created_ts,
                     activated, activated_ts, activated_price, tp_hits,
                     entry2_activated, entry2_activated_price,
-                    tp1_rehit_after_entry2_sent, reporting_expired
+                    tp1_rehit_after_entry2_sent,
+                    avg_reached_after_entry2_sent,
+                    reporting_expired
                    FROM signals"""
             ).fetchall()
 
@@ -408,13 +405,14 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                 tps_json, created_ts,
                 activated, activated_ts, activated_price, tp_hits,
                 e2_activated, e2_activated_price,
-                tp1_rehit_sent, reporting_expired
+                tp1_rehit_sent,
+                avg_reached_sent,
+                reporting_expired
             ) in rows:
 
                 if stop_event.is_set():
                     break
 
-                # If already marked expired, skip
                 if reporting_expired:
                     continue
 
@@ -426,7 +424,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
 
                 tps = json.loads(tps_json)
 
-                # 1) Activation validity (created_ts + 30d) affects activation for WAIT
+                # 1) WAIT activation within created_ts window
                 if not activated and mode == "WAIT":
                     if not is_activation_valid(now_ts, created_ts):
                         continue
@@ -438,7 +436,6 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
                             (now_ts, price, sid)
                         )
-                        # If activated directly in entry2 zone, mark entry2 as active too (still within 30d)
                         if in_e2 and e2l is not None and e2h is not None:
                             conn.execute(
                                 "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
@@ -463,7 +460,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                         conn.commit()
                         continue
 
-                # Determine entry1_price for performance/TP calculations
+                # Entry1 price for existing profit logic (DO NOT CHANGE)
                 if activated:
                     entry1_price = activated_price if activated_price is not None else price
                     if entry1_price is None or entry1_price == 0:
@@ -471,12 +468,12 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                 else:
                     entry1_price = None
 
-                # Compute current performance from entry1 (used to disable entry2 after +18%)
+                # Current performance from entry1 (used to disable entry2 after +15%)
                 perf_from_e1 = 0.0
                 if activated and entry1_price:
                     perf_from_e1 = pct_from_entry(price, entry1_price, side)
 
-                # 2) Entry2 activation rules: only if within 30d from created_ts and perf < 18%
+                # 2) Entry2 activation rules (within 30d and perf < 15%)
                 if activated and (not e2_activated) and (e2l is not None) and (e2h is not None):
                     entry2_allowed = is_activation_valid(now_ts, created_ts) and (perf_from_e1 < ENTRY2_DISABLE_PROFIT_PCT)
                     if entry2_allowed and in_range(price, e2l, e2h):
@@ -494,7 +491,29 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                             f"Entry2 zóna: {fmt(e2l)} - {fmt(e2h)}"
                         )
 
-                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
+                # 2.5) AVG (Entry1+Entry2) reached report (INFO ONLY, no profit logic changes)
+                if activated and e2_activated and (avg_reached_sent == 0):
+                    if entry1_price and e2_activated_price and e2_activated_price != 0:
+                        avg_price = (float(entry1_price) + float(e2_activated_price)) / 2.0
+                        avg_reached_now = (price >= avg_price) if side == "LONG" else (price <= avg_price)
+                        if avg_reached_now:
+                            await post_target(
+                                bot,
+                                "ℹ️ Po zprůměrování 1. Entry price a 2. Entry price jsme aktuálně zpátky na zprůměrované ceně těchto pozic.\n"
+                                f"{symbol} ({side})\n"
+                                f"Entry1: {fmt(entry1_price)}\n"
+                                f"Entry2: {fmt(e2_activated_price)}\n"
+                                f"Zprůměrovaná cena: {fmt(avg_price)}\n"
+                                f"Aktuální cena: {fmt(price)}"
+                            )
+                            conn.execute(
+                                "UPDATE signals SET avg_reached_after_entry2_sent=1 WHERE id=?",
+                                (sid,)
+                            )
+                            conn.commit()
+                            avg_reached_sent = 1
+
+                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE) - keeps existing logic
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
                     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
@@ -517,7 +536,7 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
                         conn.commit()
                         tp1_rehit_sent = 1
 
-                # 4) Normal TP hits
+                # 4) Normal TP hits (existing logic unchanged)
                 if activated:
                     entry2_price = e2_activated_price if e2_activated else None
 
@@ -559,9 +578,6 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
         await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 async def lock_renew_loop(conn, stop_event: asyncio.Event):
-    """
-    Keeps the lease alive. If renewal fails, we stop the bot loops so another instance can take over.
-    """
     while not stop_event.is_set():
         ok = await renew_lock(conn, INSTANCE_ID)
         if not ok:
@@ -586,7 +602,6 @@ async def main_async():
     while True:
         got = await acquire_lock(conn, INSTANCE_ID)
         if not got:
-            # Not leader: do nothing (prevents Conflict and duplicates)
             log(f"Not leader. Waiting... lock={lock_status_str(conn)}")
             await asyncio.sleep(10)
             continue
@@ -596,7 +611,7 @@ async def main_async():
         stop_event = asyncio.Event()
         renew_task = asyncio.create_task(lock_renew_loop(conn, stop_event))
 
-        # Anti-spam ping 1x/24h (only leader should do this)
+        # Anti-spam ping 1x/24h (leader only)
         try:
             now = int(time.time())
             last_ping = int(state_get(conn, "startup_ping_ts", "0"))
@@ -613,7 +628,6 @@ async def main_async():
             while not stop_event.is_set():
                 status, updates = await asyncio.to_thread(tg_get_updates, offset + 1, 20)
 
-                # With lock, Conflict should not happen; if it does, we just wait a bit.
                 if status == "conflict":
                     log("getUpdates Conflict (unexpected with lock) -> sleeping 10s")
                     await asyncio.sleep(10)
@@ -691,20 +705,16 @@ async def main_async():
 
         finally:
             stop_event.set()
-
             for t in (monitor_task, renew_task):
                 try:
                     t.cancel()
                 except Exception:
                     pass
-
             for t in (monitor_task, renew_task):
                 try:
                     await t
                 except Exception:
                     pass
-
-            # If we lost lock, loop will attempt to re-acquire; otherwise keep running.
             await asyncio.sleep(2)
 
 if __name__ == "__main__":
