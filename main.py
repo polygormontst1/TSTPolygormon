@@ -19,7 +19,7 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Páka pro výpočet "s pákou" (např. 20x). Spot % zůstává vždy "čistého trhu".
+# Páka pro výpočet "s pákou"
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 
 # Telegram raw API
@@ -28,11 +28,6 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # =========================
 # PARSING
 # =========================
-# Supported:
-# BTC/USDT Long           => MARKET LONG (activate immediately)
-# BTC/USDT Short          => MARKET SHORT (activate immediately)
-# BTC/USDT Buy on         => WAIT LONG
-# BTC/USDT Short on       => WAIT SHORT
 PAIR_RE = re.compile(
     r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(LONG|SHORT|BUY|SELL)\b(?:\s+(ON)\b)?",
     re.IGNORECASE | re.MULTILINE
@@ -41,7 +36,6 @@ PAIR_RE = re.compile(
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 
-# Rezistenční úrovně = TPs
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def parse_range(a, b):
@@ -105,9 +99,6 @@ def parse_signal(text: str):
     if not tps:
         return None
 
-    # pořadí TP:
-    # LONG: od nejnižší k nejvyšší
-    # SHORT: od nejvyšší k nejnižší
     tps = sorted(tps, reverse=(side == "SHORT"))
 
     return {
@@ -145,9 +136,24 @@ def connect_db():
             activated INTEGER NOT NULL DEFAULT 0,
             activated_ts INTEGER,
             activated_price REAL,
-            tp_hits INTEGER NOT NULL DEFAULT 0
+            tp_hits INTEGER NOT NULL DEFAULT 0,
+            entry2_activated INTEGER NOT NULL DEFAULT 0,
+            entry2_activated_ts INTEGER,
+            entry2_activated_price REAL
         )
     """)
+
+    # Pokud běžíš se starou DB bez nových sloupců, přidáme je safe přes ALTER
+    # (SQLite neumí IF NOT EXISTS u ADD COLUMN ve všech verzích, tak to zkusíme a ignorujeme chybu)
+    for sql in [
+        "ALTER TABLE signals ADD COLUMN entry2_activated INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN entry2_activated_ts INTEGER",
+        "ALTER TABLE signals ADD COLUMN entry2_activated_price REAL",
+    ]:
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS state (
@@ -231,7 +237,7 @@ async def get_price(symbol: str):
     return await asyncio.to_thread(get_price_sync, symbol)
 
 # =========================
-# RAW LONG-POLL (NO PTB get_updates)
+# RAW LONG-POLL
 # =========================
 def tg_get_updates(offset: int, timeout: int = 20):
     try:
@@ -287,8 +293,13 @@ def extract_posts(updates):
     return max_update_id, posts
 
 # =========================
-# MONITOR (ACTIVATE + TP HITS)
+# MONITOR (ACTIVATE + ENTRY2 + TP HITS)
 # =========================
+def in_range(price, low, high):
+    if price is None or low is None or high is None:
+        return False
+    return low <= price <= high
+
 async def monitor_prices(bot: Bot, conn):
     log("monitor_prices() started")
     while True:
@@ -297,53 +308,76 @@ async def monitor_prices(bot: Bot, conn):
                 """SELECT
                     id, symbol, side, mode,
                     entry1_low, entry1_high, entry2_low, entry2_high,
-                    tps_json, activated, activated_price, tp_hits
+                    tps_json, activated, activated_price, tp_hits,
+                    entry2_activated, entry2_activated_price
                    FROM signals"""
             ).fetchall()
 
             log(f"monitor tick: signals={len(rows)}" if rows else "monitor tick: no signals")
 
-            for (sid, symbol, side, mode, e1l, e1h, e2l, e2h, tps_json, activated, activated_price, tp_hits) in rows:
+            for (sid, symbol, side, mode, e1l, e1h, e2l, e2h, tps_json, activated, activated_price, tp_hits, e2_activated, e2_activated_price) in rows:
                 price = await get_price(symbol)
-                log(f"check sid={sid} {symbol} {side} mode={mode} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits}")
+                log(f"check sid={sid} {symbol} {side} mode={mode} price={price} entry1={e1l}-{e1h} entry2={e2l}-{e2h} activated={activated} tp_hits={tp_hits} e2_activated={e2_activated}")
 
                 if price is None:
                     continue
 
                 tps = json.loads(tps_json)
 
-                # WAIT activation
+                # WAIT activation (Entry1 OR Entry2)
                 if not activated and mode == "WAIT":
-                    in_entry = (e1l <= price <= e1h)
-                    if (not in_entry) and (e2l is not None) and (e2h is not None):
-                        in_entry = (e2l <= price <= e2h)
+                    in_entry = in_range(price, e1l, e1h)
+                    in_entry2 = (not in_entry) and in_range(price, e2l, e2h)
 
-                    if in_entry:
-                        log(f"ACTIVATE WAIT sid={sid} {symbol} price={price} in range.")
+                    if in_entry or in_entry2:
+                        log(f"ACTIVATE WAIT sid={sid} {symbol} price={price} in range (entry={'1' if in_entry else '2'}).")
                         conn.execute(
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
                             (int(time.time()), price, sid)
                         )
+                        # pokud se WAIT aktivoval rovnou v Entry2, označíme Entry2 jako aktivovanou taky
+                        if in_entry2 and e2l is not None and e2h is not None:
+                            conn.execute(
+                                "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
+                                (int(time.time()), price, sid)
+                            )
+                            e2_activated = 1
+                            e2_activated_price = price
+
                         conn.commit()
                         await post_target(bot,
                             "✅ Signál aktivován\n"
                             f"{symbol} ({side})\n"
-                            f"Vstup (entry): {fmt(price)}\n"
+                            f"Vstup (Entry1): {fmt(price)}\n"
                             f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
                         )
                     continue
 
+                # AFTER ACTIVATION: hlídáme Entry2 “dokup” zónu (pro MARKET i WAIT)
+                if activated and (not e2_activated) and (e2l is not None) and (e2h is not None):
+                    if in_range(price, e2l, e2h):
+                        log(f"ENTRY2 ACTIVATED sid={sid} {symbol} price={price} in Entry2.")
+                        conn.execute(
+                            "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
+                            (int(time.time()), price, sid)
+                        )
+                        conn.commit()
+                        e2_activated = 1
+                        e2_activated_price = price
+                        await post_target(bot,
+                            "📌 Entry2 aktivována (čekací zóna)\n"
+                            f"{symbol} ({side})\n"
+                            f"Entry2 cena: {fmt(price)}\n"
+                            f"Entry2 zóna: {fmt(e2l)} - {fmt(e2h)}"
+                        )
+
                 # TP hits (only after activation)
                 if activated:
-                    entry_price = activated_price if activated_price is not None else price
-                    if entry_price is None or entry_price == 0:
-                        entry_price = price
+                    entry1_price = activated_price if activated_price is not None else price
+                    if entry1_price is None or entry1_price == 0:
+                        entry1_price = price
 
-                    # DEBUG: vypiš další TP a podmínku hitu (tohle ti řekne "proč ještě nic nepřišlo")
-                    if tp_hits < len(tps):
-                        next_tp = float(tps[tp_hits])
-                        would_hit = (price >= next_tp) if side == "LONG" else (price <= next_tp)
-                        log(f"TP DEBUG sid={sid}: next_tp=TP{tp_hits+1}({next_tp}) price={price} side={side} would_hit={would_hit}")
+                    entry2_price = e2_activated_price if e2_activated else None
 
                     while tp_hits < len(tps):
                         tp = float(tps[tp_hits])
@@ -355,15 +389,27 @@ async def monitor_prices(bot: Bot, conn):
                         conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
                         conn.commit()
 
-                        gain_spot = pct_from_entry(tp, entry_price, side)
-                        gain_lev = gain_spot * LEVERAGE
+                        # Zisky z Entry1 + (pokud aktivní) z Entry2
+                        g1_spot = pct_from_entry(tp, entry1_price, side)
+                        g1_lev = g1_spot * LEVERAGE
+
+                        if entry2_price is not None and entry2_price != 0:
+                            g2_spot = pct_from_entry(tp, entry2_price, side)
+                            g2_lev = g2_spot * LEVERAGE
+                            profit_line = (
+                                f"Zisk: {g1_spot:.2f}% ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
+                                f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
+                            )
+                        else:
+                            profit_line = f"Zisk: {g1_spot:.2f}% čistého trhu ({g1_lev:.2f}% s pákou {LEVERAGE:g}x)"
 
                         await post_target(bot,
                             f"🎯 {symbol} – TP{tp_hits} HIT\n"
                             f"Směr: {side}\n"
-                            f"Entry: {fmt(entry_price)}\n"
+                            f"Entry1: {fmt(entry1_price)}\n"
+                            f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
                             f"TP{tp_hits}: {fmt(tp)}\n"
-                            f"Zisk: {gain_spot:.2f}% čistého trhu ({gain_lev:.2f}% s pákou {LEVERAGE:g}x)"
+                            f"{profit_line}"
                         )
 
         except Exception as e:
@@ -424,9 +470,6 @@ async def main_async():
 
                 s = parse_signal(p["text"])
                 if not s:
-                    log("PARSE FAIL (ignored message) -------------------------")
-                    log(p["text"])
-                    log("-------------------------------------------------------")
                     continue
 
                 sid = save_signal(conn, p["message_id"], s)
@@ -447,7 +490,7 @@ async def main_async():
 
                 log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
 
-                # MARKET => aktivace ihned, uložíme activated_price a pak už TP hlídá monitor
+                # MARKET => aktivace ihned (Entry1 = cena aktivace)
                 if s["mode"] == "MARKET":
                     price_now = await get_price(s["symbol"])
                     if price_now is None:
@@ -461,7 +504,8 @@ async def main_async():
                         await post_target(bot,
                             "✅ Signál aktivován (MARKET)\n"
                             f"{s['symbol']} ({s['side']})\n"
-                            f"Vstup (entry): {fmt(price_now)}\n"
+                            f"Vstup (Entry1): {fmt(price_now)}\n"
+                            f"{('Entry2: ' + fmt(s['entry2_low']) + ' - ' + fmt(s['entry2_high'])) if (s['entry2_low'] is not None and s['entry2_high'] is not None) else 'Entry2: -'}\n"
                             f"TPs: {len(s['tps'])}"
                         )
                         log(f"MARKET activated sid={sid} {s['symbol']} price={price_now}")
