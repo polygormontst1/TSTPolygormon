@@ -41,7 +41,7 @@ PAIR_RE = re.compile(
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 
-# Rezistenční úrovně = TPs (už to máte takhle)
+# Rezistenční úrovně = TPs
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def parse_range(a, b):
@@ -335,12 +335,15 @@ async def monitor_prices(bot: Bot, conn):
 
                 # TP hits (only after activation)
                 if activated:
-                    # entry pro výpočet % = reálná aktivace (market nebo wait)
                     entry_price = activated_price if activated_price is not None else price
-
-                    # pro jistotu refresh entry_price z DB pokud tam je 0/None
                     if entry_price is None or entry_price == 0:
                         entry_price = price
+
+                    # DEBUG: vypiš další TP a podmínku hitu (tohle ti řekne "proč ještě nic nepřišlo")
+                    if tp_hits < len(tps):
+                        next_tp = float(tps[tp_hits])
+                        would_hit = (price >= next_tp) if side == "LONG" else (price <= next_tp)
+                        log(f"TP DEBUG sid={sid}: next_tp=TP{tp_hits+1}({next_tp}) price={price} side={side} would_hit={would_hit}")
 
                     while tp_hits < len(tps):
                         tp = float(tps[tp_hits])
@@ -421,6 +424,9 @@ async def main_async():
 
                 s = parse_signal(p["text"])
                 if not s:
+                    log("PARSE FAIL (ignored message) -------------------------")
+                    log(p["text"])
+                    log("-------------------------------------------------------")
                     continue
 
                 sid = save_signal(conn, p["message_id"], s)
