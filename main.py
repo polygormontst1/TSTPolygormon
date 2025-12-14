@@ -1,4 +1,4 @@
-import os, re, time, json, sqlite3, asyncio
+import os, re, time, json, sqlite3, asyncio, signal
 import requests
 from telegram import Bot
 from telegram.error import TelegramError
@@ -19,11 +19,13 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Páka pro výpočet "s pákou"
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
-
-# Telegram raw API
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Lease-lock
+LOCK_LEASE_SEC = int(os.getenv("LOCK_LEASE_SEC", "120"))
+LOCK_HEARTBEAT_SEC = int(os.getenv("LOCK_HEARTBEAT_SEC", "30"))
+INSTANCE_ID = f"{os.getenv('RENDER_INSTANCE_ID','') or os.getenv('HOSTNAME','')}-{os.getpid()}".strip("-")
 
 # =========================
 # PARSING
@@ -32,10 +34,8 @@ PAIR_RE = re.compile(
     r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(LONG|SHORT|BUY|SELL)\b(?:\s+(ON)\b)?",
     re.IGNORECASE | re.MULTILINE
 )
-
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
-
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
 
 def parse_range(a, b):
@@ -143,8 +143,7 @@ def connect_db():
         )
     """)
 
-    # Pokud běžíš se starou DB bez nových sloupců, přidáme je safe přes ALTER
-    # (SQLite neumí IF NOT EXISTS u ADD COLUMN ve všech verzích, tak to zkusíme a ignorujeme chybu)
+    # Safe ALTER for existing DBs
     for sql in [
         "ALTER TABLE signals ADD COLUMN entry2_activated INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN entry2_activated_ts INTEGER",
@@ -161,6 +160,16 @@ def connect_db():
             v TEXT NOT NULL
         )
     """)
+
+    # Lease lock table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_lock (
+            k TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            lease_until INTEGER NOT NULL
+        )
+    """)
+
     conn.commit()
     return conn
 
@@ -195,6 +204,46 @@ def save_signal(conn, source_message_id: int, s: dict):
         return cur.lastrowid
     except sqlite3.IntegrityError:
         return None
+
+# =========================
+# LEASE LOCK
+# =========================
+def lock_try_acquire(conn, lease_sec: int):
+    now = int(time.time())
+    lease_until = now + lease_sec
+    conn.execute("BEGIN IMMEDIATE;")
+    row = conn.execute("SELECT owner, lease_until FROM bot_lock WHERE k='poller'").fetchone()
+    if row and row[1] > now and row[0] != INSTANCE_ID:
+        conn.execute("COMMIT;")
+        return False
+    conn.execute("""
+        INSERT INTO bot_lock(k, owner, lease_until)
+        VALUES('poller', ?, ?)
+        ON CONFLICT(k) DO UPDATE SET owner=excluded.owner, lease_until=excluded.lease_until
+    """, (INSTANCE_ID, lease_until))
+    conn.execute("COMMIT;")
+    return True
+
+def lock_heartbeat(conn, lease_sec: int):
+    now = int(time.time())
+    cur = conn.execute("""
+        UPDATE bot_lock SET lease_until=?
+        WHERE k='poller' AND owner=?
+    """, (now + lease_sec, INSTANCE_ID))
+    conn.commit()
+    return cur.rowcount == 1
+
+async def heartbeat_task(conn):
+    while True:
+        ok = False
+        try:
+            ok = lock_heartbeat(conn, LOCK_LEASE_SEC)
+        except Exception as e:
+            log(f"lock heartbeat error: {e}")
+        if not ok:
+            log("LOCK LOST -> stopping (another instance owns the lock).")
+            os._exit(0)
+        await asyncio.sleep(LOCK_HEARTBEAT_SEC)
 
 # =========================
 # TELEGRAM SEND
@@ -326,24 +375,20 @@ async def monitor_prices(bot: Bot, conn):
 
                 # WAIT activation (Entry1 OR Entry2)
                 if not activated and mode == "WAIT":
-                    in_entry = in_range(price, e1l, e1h)
-                    in_entry2 = (not in_entry) and in_range(price, e2l, e2h)
-
-                    if in_entry or in_entry2:
-                        log(f"ACTIVATE WAIT sid={sid} {symbol} price={price} in range (entry={'1' if in_entry else '2'}).")
+                    in_e1 = in_range(price, e1l, e1h)
+                    in_e2 = (not in_e1) and in_range(price, e2l, e2h)
+                    if in_e1 or in_e2:
                         conn.execute(
                             "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
                             (int(time.time()), price, sid)
                         )
-                        # pokud se WAIT aktivoval rovnou v Entry2, označíme Entry2 jako aktivovanou taky
-                        if in_entry2 and e2l is not None and e2h is not None:
+                        if in_e2 and e2l is not None and e2h is not None:
                             conn.execute(
                                 "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
                                 (int(time.time()), price, sid)
                             )
                             e2_activated = 1
                             e2_activated_price = price
-
                         conn.commit()
                         await post_target(bot,
                             "✅ Signál aktivován\n"
@@ -353,10 +398,9 @@ async def monitor_prices(bot: Bot, conn):
                         )
                     continue
 
-                # AFTER ACTIVATION: hlídáme Entry2 “dokup” zónu (pro MARKET i WAIT)
+                # AFTER ACTIVATION: watch Entry2 zone (MARKET + WAIT)
                 if activated and (not e2_activated) and (e2l is not None) and (e2h is not None):
                     if in_range(price, e2l, e2h):
-                        log(f"ENTRY2 ACTIVATED sid={sid} {symbol} price={price} in Entry2.")
                         conn.execute(
                             "UPDATE signals SET entry2_activated=1, entry2_activated_ts=?, entry2_activated_price=? WHERE id=?",
                             (int(time.time()), price, sid)
@@ -371,12 +415,11 @@ async def monitor_prices(bot: Bot, conn):
                             f"Entry2 zóna: {fmt(e2l)} - {fmt(e2h)}"
                         )
 
-                # TP hits (only after activation)
+                # TP hits
                 if activated:
                     entry1_price = activated_price if activated_price is not None else price
                     if entry1_price is None or entry1_price == 0:
                         entry1_price = price
-
                     entry2_price = e2_activated_price if e2_activated else None
 
                     while tp_hits < len(tps):
@@ -389,7 +432,6 @@ async def monitor_prices(bot: Bot, conn):
                         conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
                         conn.commit()
 
-                        # Zisky z Entry1 + (pokud aktivní) z Entry2
                         g1_spot = pct_from_entry(tp, entry1_price, side)
                         g1_lev = g1_spot * LEVERAGE
 
@@ -422,10 +464,25 @@ async def monitor_prices(bot: Bot, conn):
 # =========================
 async def main_async():
     log("START: main_async entered")
-    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} LEVERAGE={LEVERAGE:g}")
+    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} LEVERAGE={LEVERAGE:g} INSTANCE={INSTANCE_ID}")
 
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
+
+    # Acquire lock (hard gate)
+    if not lock_try_acquire(conn, LOCK_LEASE_SEC):
+        log("LOCK NOT ACQUIRED -> another instance is running. Sleeping forever.")
+        while True:
+            await asyncio.sleep(60)
+
+    # Start heartbeat (if we lose the lock, exit)
+    asyncio.create_task(heartbeat_task(conn))
+
+    # Optional: ensure webhook is cleared (cheap safety)
+    try:
+        requests.post(f"{TG_API}/setWebhook", data={"url": ""}, timeout=10)
+    except Exception:
+        pass
 
     # Anti-spam ping 1x/24h
     now = int(time.time())
@@ -442,8 +499,9 @@ async def main_async():
             status, updates = await asyncio.to_thread(tg_get_updates, offset + 1, 20)
 
             if status == "conflict":
-                log("getUpdates Conflict -> sleeping 60s to yield to other poller")
-                await asyncio.sleep(60)
+                # With the lock in place, this should stop happening.
+                log("getUpdates Conflict (unexpected with lock) -> sleeping 10s")
+                await asyncio.sleep(10)
                 continue
 
             if status == "unauthorized":
@@ -490,7 +548,7 @@ async def main_async():
 
                 log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
 
-                # MARKET => aktivace ihned (Entry1 = cena aktivace)
+                # MARKET => activate immediately (Entry1 = activation price)
                 if s["mode"] == "MARKET":
                     price_now = await get_price(s["symbol"])
                     if price_now is None:
