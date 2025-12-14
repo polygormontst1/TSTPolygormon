@@ -1,4 +1,4 @@
-import os, re, time, json, sqlite3, asyncio, uuid
+import os, re, time, json, sqlite3, asyncio
 import requests
 from telegram import Bot
 from telegram.error import TelegramError
@@ -19,20 +19,22 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "3"))
 ENTRY_REF_MODE = os.getenv("ENTRY_REF_MODE", "HIGH").upper()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Lock (anti-Conflict)
-INSTANCE_ID = os.getenv("INSTANCE_ID", str(uuid.uuid4())[:8])
-LOCK_KEY_OWNER = "poll_lock_owner"
-LOCK_KEY_TS = "poll_lock_ts"
-LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "45"))
-LOCK_REFRESH_SEC = int(os.getenv("LOCK_REFRESH_SEC", "10"))
+# Telegram raw API
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================
 # PARSING
 # =========================
+# Supported:
+# BTC/USDT Long           => MARKET LONG (activate immediately)
+# BTC/USDT Short          => MARKET SHORT (activate immediately)
+# BTC/USDT Buy on         => WAIT LONG
+# BTC/USDT Short on       => WAIT SHORT
 PAIR_RE = re.compile(
     r"^\s*([A-Z0-9]+)\s*/\s*(USDT)\s*(LONG|SHORT|BUY|SELL)\b(?:\s+(ON)\b)?",
     re.IGNORECASE | re.MULTILINE
 )
+
 ENTRY1_RE = re.compile(r"1\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 ENTRY2_RE = re.compile(r"2\.\s*Entry price:\s*([0-9.]+)\s*(?:-\s*([0-9.]+))?", re.IGNORECASE)
 RES_RE = re.compile(r"Rezistenční úrovně:\s*(.+?)(?:\n\n|\nStop Loss:|\Z)", re.IGNORECASE | re.DOTALL)
@@ -62,25 +64,22 @@ def parse_signal(text: str):
 
     base = m.group(1).upper()
     quote = m.group(2).upper()
-    action = (m.group(3) or "").lower()  # long/short/buy/sell
+    action = (m.group(3) or "").lower()
     has_on = (m.group(4) or "").lower() == "on"
     symbol = f"{base}{quote}"
 
-    # TVOJE pravidla:
-    # - Long / Short => MARKET (aktivace ihned)
-    # - Buy on / Short on => WAIT (čeká na entry)
     if action == "long":
         side = "LONG"
         mode = "MARKET"
     elif action == "short":
         side = "SHORT"
-        mode = "WAIT" if has_on else "MARKET"   # "Short on" => WAIT, "Short" => MARKET
+        mode = "WAIT" if has_on else "MARKET"
     elif action == "buy":
         side = "LONG"
-        mode = "WAIT"  # "Buy on" => WAIT (povolené i když někdo napíše jen "Buy")
+        mode = "WAIT"
     elif action == "sell":
         side = "SHORT"
-        mode = "WAIT"  # "Sell on" => WAIT
+        mode = "WAIT"
     else:
         return None
 
@@ -107,7 +106,7 @@ def parse_signal(text: str):
     return {
         "symbol": symbol,
         "side": side,
-        "mode": mode,  # MARKET / WAIT
+        "mode": mode,
         "entry1_low": entry1_low,
         "entry1_high": entry1_high,
         "entry2_low": entry2_low,
@@ -149,14 +148,6 @@ def connect_db():
             v TEXT NOT NULL
         )
     """)
-
-    # migrace pro staré DB
-    try:
-        conn.execute("ALTER TABLE signals ADD COLUMN mode TEXT NOT NULL DEFAULT 'WAIT'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
     conn.commit()
     return conn
 
@@ -193,7 +184,7 @@ def save_signal(conn, source_message_id: int, s: dict):
         return None
 
 # =========================
-# TELEGRAM
+# TELEGRAM SEND
 # =========================
 async def send_to(bot: Bot, chat_id: int, text: str):
     try:
@@ -212,14 +203,10 @@ async def post_target(bot: Bot, text: str):
 # =========================
 def get_price_sync(symbol: str):
     try:
-        r = requests.get(
-            PROXY_PRICE_URL,
-            params={"symbol": symbol},
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"}
-        )
+        r = requests.get(PROXY_PRICE_URL, params={"symbol": symbol}, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,*/*"})
         if r.status_code != 200:
-            log(f"get_price({symbol}) worker status={r.status_code} body={r.text[:200]}")
+            log(f"get_price({symbol}) worker status={r.status_code} body={r.text[:120]}")
             return None
         data = r.json()
         if isinstance(data, dict) and "price" in data:
@@ -233,62 +220,62 @@ async def get_price(symbol: str):
     return await asyncio.to_thread(get_price_sync, symbol)
 
 # =========================
-# ANTI-CONFLICT LOCK
+# RAW LONG-POLL (NO PTB get_updates)
 # =========================
-def try_acquire_lock(conn) -> bool:
-    now = int(time.time())
-    owner = state_get(conn, LOCK_KEY_OWNER, "")
-    ts = int(state_get(conn, LOCK_KEY_TS, "0"))
-
-    if (not owner) or (now - ts > LOCK_TTL_SEC):
-        state_set(conn, LOCK_KEY_OWNER, INSTANCE_ID)
-        state_set(conn, LOCK_KEY_TS, str(now))
-        log(f"LOCK ACQUIRED owner={INSTANCE_ID} (prev_owner={owner or '-'} age={now-ts}s)")
-        return True
-
-    if owner == INSTANCE_ID:
-        state_set(conn, LOCK_KEY_TS, str(now))
-        return True
-
-    log(f"LOCK BUSY owner={owner} age={now-ts}s (me={INSTANCE_ID})")
-    return False
-
-def refresh_lock(conn) -> bool:
-    owner = state_get(conn, LOCK_KEY_OWNER, "")
-    if owner != INSTANCE_ID:
-        return False
-    state_set(conn, LOCK_KEY_TS, str(int(time.time())))
-    return True
-
-# =========================
-# POLLING
-# =========================
-async def fetch_channel_posts(bot: Bot, last_update_id: int):
+def tg_get_updates(offset: int, timeout: int = 20):
     try:
-        updates = await bot.get_updates(
-            offset=last_update_id + 1,
-            timeout=20,
-            allowed_updates=["channel_post", "edited_channel_post"]
+        r = requests.get(
+            f"{TG_API}/getUpdates",
+            params={
+                "offset": offset,
+                "timeout": timeout,
+                "allowed_updates": json.dumps(["channel_post", "edited_channel_post"])
+            },
+            timeout=timeout + 5
         )
-    except TelegramError as e:
-        log(f"get_updates TelegramError: {repr(e)}")
-        return last_update_id, []
+        # Unauthorized -> token v Renderu je špatně
+        if r.status_code == 401:
+            log("getUpdates Unauthorized (token mismatch).")
+            return "unauthorized", None
 
-    if not updates:
-        return last_update_id, []
+        # Conflict -> někdo jiný polluje
+        if r.status_code == 409:
+            return "conflict", None
 
-    max_id = last_update_id
+        if r.status_code != 200:
+            log(f"getUpdates HTTP {r.status_code}: {r.text[:120]}")
+            return "error", None
+
+        data = r.json()
+        if not data.get("ok"):
+            # někdy Telegram vrátí ok=false
+            desc = data.get("description", "")
+            if "Conflict" in desc:
+                return "conflict", None
+            return "error", None
+
+        return "ok", data.get("result", [])
+    except Exception as e:
+        log(f"getUpdates exception: {e}")
+        return "error", None
+
+def extract_posts(updates):
     posts = []
+    max_update_id = None
     for u in updates:
-        max_id = max(max_id, u.update_id)
-        cp = u.channel_post or u.edited_channel_post
+        uid = u.get("update_id")
+        if uid is not None:
+            max_update_id = uid if max_update_id is None else max(max_update_id, uid)
+
+        cp = u.get("channel_post") or u.get("edited_channel_post")
         if not cp:
             continue
-        if not cp.chat or cp.chat.id != SOURCE_CHAT_ID:
+        chat = cp.get("chat", {})
+        if chat.get("id") != SOURCE_CHAT_ID:
             continue
-        text = (cp.text or cp.caption or "")
-        posts.append({"message_id": cp.message_id, "text": text})
-    return max_id, posts
+        text = cp.get("text") or cp.get("caption") or ""
+        posts.append({"message_id": cp.get("message_id"), "text": text})
+    return max_update_id, posts
 
 # =========================
 # MONITOR
@@ -363,49 +350,53 @@ async def monitor_prices(bot: Bot, conn):
 # =========================
 async def main_async():
     log("START: main_async entered")
-    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} INSTANCE={INSTANCE_ID}")
+    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH}")
 
     bot = Bot(token=BOT_TOKEN)
-
-    # ✅ SANITY CHECK TOKEN (tohle ti přesně ukáže, jakého bota Render používá)
-    try:
-        me = await bot.get_me()
-        log(f"BOT OK: @{me.username} id={me.id}")
-    except TelegramError as e:
-        log(f"BOT TOKEN ERROR: {repr(e)}")
-        return
-
     conn = connect_db()
 
-    # Acquire lock or exit
-    if not try_acquire_lock(conn):
-        log("EXIT: another instance holds the lock. (prevents getUpdates Conflict)")
-        return
-
-    # Startup ping 1x/24h
+    # Anti-spam ping 1x/24h
     now = int(time.time())
     last_ping = int(state_get(conn, "startup_ping_ts", "0"))
     if now - last_ping > 24 * 3600:
-        await post_target(bot, f"🤖 Bot běží. (instance {INSTANCE_ID})")
+        await post_target(bot, "🤖 Bot běží.")
         state_set(conn, "startup_ping_ts", str(now))
 
-    last_update_id = int(state_get(conn, "last_update_id", "0"))
+    offset = int(state_get(conn, "raw_offset", "0"))
+
     monitor_task = asyncio.create_task(monitor_prices(bot, conn))
-    last_lock_refresh = 0.0
 
     try:
         while True:
-            # refresh lock
-            if time.time() - last_lock_refresh > LOCK_REFRESH_SEC:
-                if not refresh_lock(conn):
-                    log("EXIT: lost lock to another instance.")
-                    return
-                last_lock_refresh = time.time()
+            status, updates = await asyncio.to_thread(tg_get_updates, offset + 1, 20)
 
-            last_update_id, posts = await fetch_channel_posts(bot, last_update_id)
-            state_set(conn, "last_update_id", str(last_update_id))
+            if status == "conflict":
+                # Pragmatický fix bez disku: necháme to chvíli být
+                log("getUpdates Conflict -> sleeping 60s to yield to other poller")
+                await asyncio.sleep(60)
+                continue
+
+            if status == "unauthorized":
+                log("FATAL: Unauthorized token. Fix BOT_TOKEN in Render env.")
+                await asyncio.sleep(10)
+                continue
+
+            if status != "ok":
+                await asyncio.sleep(2)
+                continue
+
+            if not updates:
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            max_uid, posts = extract_posts(updates)
+            if max_uid is not None:
+                offset = max_uid
+                state_set(conn, "raw_offset", str(offset))
 
             for p in posts:
+                if not p["message_id"]:
+                    continue
                 s = parse_signal(p["text"])
                 if not s:
                     continue
@@ -445,8 +436,6 @@ async def main_async():
                             f"Aktuální cena: {fmt(price_now)}"
                         )
                         log(f"MARKET activated sid={sid} {s['symbol']} price={price_now}")
-
-            await asyncio.sleep(POLL_INTERVAL_SEC)
 
     finally:
         monitor_task.cancel()
