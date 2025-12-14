@@ -1,4 +1,4 @@
-import os, re, time, json, sqlite3, asyncio
+import os, re, time, json, sqlite3, asyncio, socket
 import requests
 from telegram import Bot
 from telegram.error import TelegramError
@@ -25,6 +25,13 @@ LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 ACTIVATION_VALID_DAYS = int(os.getenv("ACTIVATION_VALID_DAYS", "30"))   # valid for 1EP/2EP activation from created_ts
 REPORTING_ACTIVE_DAYS = int(os.getenv("REPORTING_ACTIVE_DAYS", "60"))   # report max N days from activated_ts
 ENTRY2_DISABLE_PROFIT_PCT = float(os.getenv("ENTRY2_DISABLE_PROFIT_PCT", "18"))  # disable entry2 if perf >= N%
+
+# INSTANCE LOCK (prevents Telegram getUpdates Conflict + duplicate reporting)
+LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "90"))              # lease time
+LOCK_RENEW_EVERY_SEC = int(os.getenv("LOCK_RENEW_EVERY_SEC", "30"))  # renew cadence
+INSTANCE_ID = os.getenv("INSTANCE_ID", "").strip()
+if not INSTANCE_ID:
+    INSTANCE_ID = f"{socket.gethostname()}-pid{os.getpid()}"
 
 # Telegram raw API
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -205,6 +212,66 @@ def save_signal(conn, source_message_id: int, s: dict):
         return None
 
 # =========================
+# INSTANCE LOCK (SQLite lease)
+# =========================
+_LOCK_OWNER_KEY = "instance_lock_owner"
+_LOCK_UNTIL_KEY = "instance_lock_until"
+
+def _try_acquire_lock_sync(conn, owner: str, ttl_sec: int) -> bool:
+    """
+    Acquire or renew a lease-style lock in the `state` table.
+    Single writer wins via BEGIN IMMEDIATE.
+    """
+    now = int(time.time())
+    until = now + ttl_sec
+
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        cur_owner = conn.execute("SELECT v FROM state WHERE k=?", (_LOCK_OWNER_KEY,)).fetchone()
+        cur_until = conn.execute("SELECT v FROM state WHERE k=?", (_LOCK_UNTIL_KEY,)).fetchone()
+
+        cur_owner = cur_owner[0] if cur_owner else ""
+        cur_until = int(cur_until[0]) if cur_until and cur_until[0].isdigit() else 0
+
+        # Lock free/expired OR we already own it
+        if (cur_until <= now) or (cur_owner == owner) or (cur_owner == ""):
+            conn.execute(
+                "INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (_LOCK_OWNER_KEY, owner)
+            )
+            conn.execute(
+                "INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (_LOCK_UNTIL_KEY, str(until))
+            )
+            conn.commit()
+            return True
+
+        conn.rollback()
+        return False
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        log(f"LOCK acquire error: {e}")
+        return False
+
+async def acquire_lock(conn, owner: str) -> bool:
+    return await asyncio.to_thread(_try_acquire_lock_sync, conn, owner, LOCK_TTL_SEC)
+
+async def renew_lock(conn, owner: str) -> bool:
+    # renewal is the same operation (we keep ownership)
+    return await asyncio.to_thread(_try_acquire_lock_sync, conn, owner, LOCK_TTL_SEC)
+
+def lock_status_str(conn) -> str:
+    try:
+        o = state_get(conn, _LOCK_OWNER_KEY, "")
+        u = state_get(conn, _LOCK_UNTIL_KEY, "0")
+        return f"owner={o} until={u}"
+    except Exception:
+        return "owner=? until=?"
+
+# =========================
 # TELEGRAM SEND
 # =========================
 async def send_to(bot: Bot, chat_id: int, text: str):
@@ -316,9 +383,9 @@ def is_reporting_active(now_ts: int, activated_ts: int | None):
 def is_activation_valid(now_ts: int, created_ts: int):
     return now_ts <= created_ts + ACTIVATION_VALID_DAYS * 86400
 
-async def monitor_prices(bot: Bot, conn):
+async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event):
     log("monitor_prices() started")
-    while True:
+    while not stop_event.is_set():
         try:
             rows = conn.execute(
                 """SELECT
@@ -344,6 +411,9 @@ async def monitor_prices(bot: Bot, conn):
                 tp1_rehit_sent, reporting_expired
             ) in rows:
 
+                if stop_event.is_set():
+                    break
+
                 # If already marked expired, skip
                 if reporting_expired:
                     continue
@@ -359,7 +429,6 @@ async def monitor_prices(bot: Bot, conn):
                 # 1) Activation validity (created_ts + 30d) affects activation for WAIT
                 if not activated and mode == "WAIT":
                     if not is_activation_valid(now_ts, created_ts):
-                        # Signal is too old to activate
                         continue
 
                     in_e1 = in_range(price, e1l, e1h)
@@ -407,7 +476,7 @@ async def monitor_prices(bot: Bot, conn):
                 if activated and entry1_price:
                     perf_from_e1 = pct_from_entry(price, entry1_price, side)
 
-                # 2) Entry2 activation rules (after activation): only if within 30d from created_ts and perf < 18%
+                # 2) Entry2 activation rules: only if within 30d from created_ts and perf < 18%
                 if activated and (not e2_activated) and (e2l is not None) and (e2h is not None):
                     entry2_allowed = is_activation_valid(now_ts, created_ts) and (perf_from_e1 < ENTRY2_DISABLE_PROFIT_PCT)
                     if entry2_allowed and in_range(price, e2l, e2h):
@@ -426,7 +495,6 @@ async def monitor_prices(bot: Bot, conn):
                         )
 
                 # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
-                # Condition: TP1 already hit earlier (tp_hits >= 1) AND entry2 activated AND not sent yet
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
                     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
@@ -449,7 +517,7 @@ async def monitor_prices(bot: Bot, conn):
                         conn.commit()
                         tp1_rehit_sent = 1
 
-                # 4) Normal TP hits (only after activation, within reporting window)
+                # 4) Normal TP hits
                 if activated:
                     entry2_price = e2_activated_price if e2_activated else None
 
@@ -490,113 +558,154 @@ async def monitor_prices(bot: Bot, conn):
 
         await asyncio.sleep(CHECK_INTERVAL_SEC)
 
+async def lock_renew_loop(conn, stop_event: asyncio.Event):
+    """
+    Keeps the lease alive. If renewal fails, we stop the bot loops so another instance can take over.
+    """
+    while not stop_event.is_set():
+        ok = await renew_lock(conn, INSTANCE_ID)
+        if not ok:
+            log(f"LOCK LOST -> stopping loops. Current lock: {lock_status_str(conn)}")
+            stop_event.set()
+            return
+        await asyncio.sleep(max(5, LOCK_RENEW_EVERY_SEC))
+
 # =========================
 # MAIN
 # =========================
 async def main_async():
     log("START: main_async entered")
-    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} LEVERAGE={LEVERAGE:g}")
+    log(f"ENV: SOURCE={SOURCE_CHAT_ID} TARGET={TARGET_CHAT_ID} CHECK={CHECK_INTERVAL_SEC} POLL={POLL_INTERVAL_SEC} ENTRY_REF_MODE={ENTRY_REF_MODE} DB={DB_PATH} LEVERAGE={LEVERAGE:g} INSTANCE_ID={INSTANCE_ID}")
     log(f"RULES: activation_valid_days={ACTIVATION_VALID_DAYS} reporting_active_days={REPORTING_ACTIVE_DAYS} entry2_disable_profit_pct={ENTRY2_DISABLE_PROFIT_PCT:g}")
+    log(f"LOCK: ttl={LOCK_TTL_SEC}s renew_every={LOCK_RENEW_EVERY_SEC}s")
 
     bot = Bot(token=BOT_TOKEN)
     conn = connect_db()
 
-    # Anti-spam ping 1x/24h
-    now = int(time.time())
-    last_ping = int(state_get(conn, "startup_ping_ts", "0"))
-    if now - last_ping > 24 * 3600:
-        await post_target(bot, "🤖 Bot běží.")
-        state_set(conn, "startup_ping_ts", str(now))
+    # Leader election loop
+    while True:
+        got = await acquire_lock(conn, INSTANCE_ID)
+        if not got:
+            # Not leader: do nothing (prevents Conflict and duplicates)
+            log(f"Not leader. Waiting... lock={lock_status_str(conn)}")
+            await asyncio.sleep(10)
+            continue
 
-    offset = int(state_get(conn, "raw_offset", "0"))
-    monitor_task = asyncio.create_task(monitor_prices(bot, conn))
+        log(f"LOCK ACQUIRED -> I am leader. lock={lock_status_str(conn)}")
 
-    try:
-        while True:
-            status, updates = await asyncio.to_thread(tg_get_updates, offset + 1, 20)
+        stop_event = asyncio.Event()
+        renew_task = asyncio.create_task(lock_renew_loop(conn, stop_event))
 
-            if status == "conflict":
-                log("getUpdates Conflict -> sleeping 60s to yield to other poller")
-                await asyncio.sleep(60)
-                continue
+        # Anti-spam ping 1x/24h (only leader should do this)
+        try:
+            now = int(time.time())
+            last_ping = int(state_get(conn, "startup_ping_ts", "0"))
+            if now - last_ping > 24 * 3600:
+                await post_target(bot, "🤖 Bot běží.")
+                state_set(conn, "startup_ping_ts", str(now))
+        except Exception as e:
+            log(f"startup ping error: {e}")
 
-            if status == "unauthorized":
-                log("FATAL: Unauthorized token. Fix BOT_TOKEN in env.")
-                await asyncio.sleep(10)
-                continue
+        offset = int(state_get(conn, "raw_offset", "0"))
+        monitor_task = asyncio.create_task(monitor_prices(bot, conn, stop_event))
 
-            if status != "ok":
-                await asyncio.sleep(2)
-                continue
+        try:
+            while not stop_event.is_set():
+                status, updates = await asyncio.to_thread(tg_get_updates, offset + 1, 20)
 
-            if not updates:
+                # With lock, Conflict should not happen; if it does, we just wait a bit.
+                if status == "conflict":
+                    log("getUpdates Conflict (unexpected with lock) -> sleeping 10s")
+                    await asyncio.sleep(10)
+                    continue
+
+                if status == "unauthorized":
+                    log("FATAL: Unauthorized token. Fix BOT_TOKEN in env.")
+                    await asyncio.sleep(10)
+                    continue
+
+                if status != "ok":
+                    await asyncio.sleep(2)
+                    continue
+
+                if not updates:
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                max_uid, posts = extract_posts(updates)
+                if max_uid is not None:
+                    offset = max_uid
+                    state_set(conn, "raw_offset", str(offset))
+
+                for p in posts:
+                    if stop_event.is_set():
+                        break
+
+                    if not p["message_id"]:
+                        continue
+
+                    s = parse_signal(p["text"])
+                    if not s:
+                        continue
+
+                    sid = save_signal(conn, p["message_id"], s)
+                    if not sid:
+                        continue
+
+                    entry2_line = ""
+                    if s["entry2_low"] is not None and s["entry2_high"] is not None:
+                        entry2_line = f"Entry2: {fmt(s['entry2_low'])} - {fmt(s['entry2_high'])}\n"
+
+                    await post_source(bot,
+                        "🆕 Nový signál uložen\n"
+                        f"{s['symbol']} ({s['side']}) [{s['mode']}]\n"
+                        f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
+                        f"{entry2_line}"
+                        f"TPs (rezistenční úrovně): {len(s['tps'])}"
+                    )
+
+                    log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
+
+                    # MARKET => activate immediately (Entry1 = activation price)
+                    if s["mode"] == "MARKET":
+                        price_now = await get_price(s["symbol"])
+                        if price_now is None:
+                            log(f"MARKET activate: price None for {s['symbol']} (skip)")
+                        else:
+                            now_ts = int(time.time())
+                            conn.execute(
+                                "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
+                                (now_ts, price_now, sid)
+                            )
+                            conn.commit()
+                            await post_target(bot,
+                                "✅ Signál aktivován (MARKET)\n"
+                                f"{s['symbol']} ({s['side']})\n"
+                                f"Vstup (Entry1): {fmt(price_now)}\n"
+                                f"{('Entry2: ' + fmt(s['entry2_low']) + ' - ' + fmt(s['entry2_high'])) if (s['entry2_low'] is not None and s['entry2_high'] is not None) else 'Entry2: -'}\n"
+                                f"TPs: {len(s['tps'])}"
+                            )
+                            log(f"MARKET activated sid={sid} {s['symbol']} price={price_now}")
+
                 await asyncio.sleep(POLL_INTERVAL_SEC)
-                continue
 
-            max_uid, posts = extract_posts(updates)
-            if max_uid is not None:
-                offset = max_uid
-                state_set(conn, "raw_offset", str(offset))
+        finally:
+            stop_event.set()
 
-            for p in posts:
-                if not p["message_id"]:
-                    continue
+            for t in (monitor_task, renew_task):
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
 
-                s = parse_signal(p["text"])
-                if not s:
-                    continue
+            for t in (monitor_task, renew_task):
+                try:
+                    await t
+                except Exception:
+                    pass
 
-                sid = save_signal(conn, p["message_id"], s)
-                if not sid:
-                    continue
-
-                entry2_line = ""
-                if s["entry2_low"] is not None and s["entry2_high"] is not None:
-                    entry2_line = f"Entry2: {fmt(s['entry2_low'])} - {fmt(s['entry2_high'])}\n"
-
-                await post_source(bot,
-                    "🆕 Nový signál uložen\n"
-                    f"{s['symbol']} ({s['side']}) [{s['mode']}]\n"
-                    f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
-                    f"{entry2_line}"
-                    f"TPs (rezistenční úrovně): {len(s['tps'])}"
-                )
-
-                log(f"saved signal msg_id={p['message_id']} sid={sid} {s['symbol']} {s['side']} mode={s['mode']} entry1={s['entry1_low']}-{s['entry1_high']} entry2={s['entry2_low']}-{s['entry2_high']} tps={len(s['tps'])}")
-
-                # MARKET => activate immediately (Entry1 = activation price)
-                if s["mode"] == "MARKET":
-                    price_now = await get_price(s["symbol"])
-                    if price_now is None:
-                        log(f"MARKET activate: price None for {s['symbol']} (skip)")
-                    else:
-                        now_ts = int(time.time())
-                        conn.execute(
-                            "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                            (now_ts, price_now, sid)
-                        )
-                        conn.commit()
-                        await post_target(bot,
-                            "✅ Signál aktivován (MARKET)\n"
-                            f"{s['symbol']} ({s['side']})\n"
-                            f"Vstup (Entry1): {fmt(price_now)}\n"
-                            f"{('Entry2: ' + fmt(s['entry2_low']) + ' - ' + fmt(s['entry2_high'])) if (s['entry2_low'] is not None and s['entry2_high'] is not None) else 'Entry2: -'}\n"
-                            f"TPs: {len(s['tps'])}"
-                        )
-                        log(f"MARKET activated sid={sid} {s['symbol']} price={price_now}")
-
-            await asyncio.sleep(POLL_INTERVAL_SEC)
-
-    finally:
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+            # If we lost lock, loop will attempt to re-acquire; otherwise keep running.
+            await asyncio.sleep(2)
 
 if __name__ == "__main__":
     asyncio.run(main_async())
