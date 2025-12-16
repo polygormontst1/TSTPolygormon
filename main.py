@@ -890,7 +890,6 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             conn.commit()
                             avg_reached_sent = 1
 
-                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
                                 # 2.6) EP2 aktivní | Cena zpět nad EP1 (pošle 1x až po skutečném návratu POD->NAD)
                 if activated and e2_activated:
                     # Parse EP1/EP2 safely
@@ -980,7 +979,8 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                                 # 3) Persist best + mark as sent (anti-spam)
                                 state_set(conn, best_key, str(combined_lev_now))
                                 state_set(conn, sent_key, "1")
-
+                                
+# 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
 
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
@@ -1218,5 +1218,6 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
