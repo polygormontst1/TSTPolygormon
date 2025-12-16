@@ -180,8 +180,6 @@ def connect_db():
         "ALTER TABLE signals ADD COLUMN avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN reporting_expired INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN sheet_row INTEGER",
-        "ALTER TABLE signals ADD COLUMN max_profit_20x REAL NOT NULL DEFAULT 0",
-        "ALTER TABLE signals ADD COLUMN tp_hwm_json TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -229,57 +227,6 @@ def save_signal(conn, source_message_id: int, s: dict):
     except sqlite3.IntegrityError:
         return None
 
-
-# =========================
-# DASH DATA HELPERS (TP GRID + EP2 HWM)
-# =========================
-
-def _col_letter(n: int) -> str:
-    s = ""
-    while n > 0:
-        n, r = divmod(n-1, 26)
-        s = chr(65 + r) + s
-    return s
-
-def _dash_range(row_num: int):
-    # Signals sheet layout (after core columns A..U):
-    # V = MAX_20x
-    # W = MP_spot
-    # X = MP_20x
-    # Y..AR = TP1..TP20
-    return f"{GSHEET_SIGNALS_TAB}!V{row_num}:AR{row_num}"
-
-def _write_dash_row(service, row_num: int, values: list):
-    rng = _dash_range(row_num)
-    service.spreadsheets().values().update(
-        spreadsheetId=GSHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [values]}
-    ).execute()
-
-def _format_pct(val: float) -> str:
-    return f"{val:.1f}%"
-
-def compute_base_tp_pcts_20x(tps: list, entry_price: float, side: str) -> list:
-    out = []
-    if not entry_price:
-        return [""] * 20
-    for i in range(20):
-        if i < len(tps):
-            pct_spot = pct_from_entry(tps[i], entry_price, side)
-            out.append(pct_spot * LEVERAGE)
-        else:
-            out.append("")
-    return out
-
-def combined_profit_20x(price: float, side: str, e1_price: float, e2_active: bool, e2_price: float):
-    if not e1_price:
-        return None, None, None
-    p1 = pct_from_entry(price, e1_price, side)
-    p2 = pct_from_entry(price, e2_price, side) if (e2_active and e2_price) else 0.0
-    return p1, p2, (p1 + p2) * LEVERAGE
-
 # =========================
 # GOOGLE SHEETS
 # =========================
@@ -316,7 +263,7 @@ def _ensure_headers(service):
         rng = f"{tab_name}!A1:Z1"
         resp = service.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=rng).execute()
         values = resp.get("values", [])
-        if not values:
+        if not values or values[0] != headers:
             service.spreadsheets().values().update(
                 spreadsheetId=GSHEET_ID,
                 range=f"{tab_name}!A1",
@@ -388,7 +335,6 @@ async def gsheets_init_once(state):
         log(f"GSHEETS init error: {e}")
         return None
 
-
 async def gsheets_upsert_signal(service, conn, sid: int):
     if not service:
         return
@@ -399,7 +345,7 @@ async def gsheets_upsert_signal(service, conn, sid: int):
             entry1_low, entry1_high, entry2_low, entry2_high,
             tps_json, tp_hits, activated, activated_ts, activated_price,
             entry2_activated, entry2_activated_ts, entry2_activated_price,
-            reporting_expired, sheet_row, max_profit_20x, tp_hwm_json
+            reporting_expired, sheet_row
         FROM signals WHERE id=?""",
         (sid,)
     ).fetchone()
@@ -411,7 +357,7 @@ async def gsheets_upsert_signal(service, conn, sid: int):
      entry1_low, entry1_high, entry2_low, entry2_high,
      tps_json, tp_hits, activated, activated_ts, activated_price,
      entry2_activated, entry2_activated_ts, entry2_activated_price,
-     reporting_expired, sheet_row, max_profit_20x, tp_hwm_json) = row
+     reporting_expired, sheet_row) = row
 
     tp_count = len(json.loads(tps_json))
     db_row = {
@@ -434,9 +380,7 @@ async def gsheets_upsert_signal(service, conn, sid: int):
         "entry2_activated": entry2_activated,
         "entry2_activated_ts": entry2_activated_ts,
         "entry2_activated_price": entry2_activated_price,
-        "reporting_expired": reporting_expired,
-        "max_profit_20x": max_profit_20x,
-        "tp_hwm_json": tp_hwm_json
+        "reporting_expired": reporting_expired
     }
 
     out_row = build_signals_row(db_row)
@@ -465,91 +409,6 @@ async def gsheets_append_profit(service, profit_row: list):
 # =========================
 _LOCK_OWNER_KEY = "instance_lock_owner"
 _LOCK_UNTIL_KEY = "instance_lock_until"
-
-
-
-async def gsheets_upsert_dash(conn, service, sid: int, sheet_row: int, price_now: float):
-    row = conn.execute(
-        """SELECT side, tps_json, activated, activated_price,
-                  entry2_activated, entry2_activated_price, tp_hits,
-                  max_profit_20x, tp_hwm_json
-             FROM signals WHERE id=?""",
-        (sid,)
-    ).fetchone()
-    if not row:
-        return
-
-    side, tps_json, activated, activated_price, e2_act, e2_price, tp_hits, max_20x, tp_hwm_json = row
-    if not activated or not activated_price:
-        return
-
-    tps = json.loads(tps_json) if tps_json else []
-    base_tp = compute_base_tp_pcts_20x(tps, float(activated_price), side)
-
-    # current combined profit (EP1 + EP2 if active)
-    p1, p2, comb_lev = combined_profit_20x(
-        price_now,
-        side,
-        float(activated_price),
-        bool(e2_act),
-        float(e2_price) if e2_price else 0.0
-    )
-    if comb_lev is None:
-        return
-
-    # MAX_20x high-water mark updates every tick
-    try:
-        stored_max = float(max_20x or 0)
-    except:
-        stored_max = 0.0
-    if comb_lev > stored_max:
-        stored_max = comb_lev
-        conn.execute("UPDATE signals SET max_profit_20x=? WHERE id=?", (stored_max, sid))
-        conn.commit()
-
-    # TP HWM list (20), not used for overwrite unless you later record improvements on hit
-    try:
-        hwm = json.loads(tp_hwm_json) if tp_hwm_json else [None] * 20
-        if not isinstance(hwm, list):
-            hwm = [None] * 20
-    except:
-        hwm = [None] * 20
-    while len(hwm) < 20:
-        hwm.append(None)
-    if len(hwm) > 20:
-        hwm = hwm[:20]
-
-    hits = int(tp_hits or 0)
-    tp_vals = []
-    for i in range(20):
-        base = base_tp[i]
-        best = hwm[i]
-        val = None
-        if base != "" and base is not None:
-            val = float(base)
-        if isinstance(best, (int, float)):
-            if val is None or float(best) > val:
-                val = float(best)
-        if val is None:
-            tp_vals.append("")
-        else:
-            txt = _format_pct(val)
-            if (i + 1) <= hits:
-                txt = "✓ " + txt
-            tp_vals.append(txt)
-
-    mp_spot = pct_from_entry(price_now, float(activated_price), side)
-    mp_20x = mp_spot * LEVERAGE
-
-    values = [""] * 23  # V..AR
-    values[0] = _format_pct(stored_max)  # V MAX_20x
-    values[1] = _format_pct(mp_spot)     # W MP_spot
-    values[2] = _format_pct(mp_20x)      # X MP_20x
-    values[3:23] = tp_vals               # Y..AR TP1..TP20
-
-    await asyncio.to_thread(_write_dash_row, service, int(sheet_row), values)
-
-
 
 def _try_acquire_lock_sync(conn, owner: str, ttl_sec: int) -> bool:
     now = int(time.time())
@@ -782,16 +641,14 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event, gs_state: di
 
                         # Sheets update
                         await gsheets_upsert_signal(service, conn, sid)
-# DASH GRID (V..AR): MAX_20x, MP, TP1..TP20
-try:
-    sr = conn.execute(
-        "SELECT sheet_row FROM signals WHERE id=?", (sid,)
-    ).fetchone()
-    srn = int(sr[0]) if sr and sr[0] else 0
-    if srn > 1:
-        await gsheets_upsert_dash(conn, service, sid, srn, float(price))
-except Exception as e:
-    log(f"GSHEETS dash update failed sid={sid} err={e}")
+
+                        await post_target(bot,
+                            "✅ Signál aktivován\n"
+                            f"{symbol} ({side})\n"
+                            f"Vstup (Entry1): {fmt(price)}\n"
+                            f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
+                        )
+                    continue
 
                 # After activation: enforce reporting window
                 if activated:
@@ -1089,9 +946,5 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
-
-
-
-
 
 
