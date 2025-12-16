@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 def log(msg: str):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
-log("VERSION: GSHEETS_BUILD_002")
+log("VERSION: GSHEETS_BUILD_003_TPGRID_EP2_HWM")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"].strip())
@@ -171,6 +171,10 @@ def connect_db():
 
             tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
             avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
+            ep1_reclaim_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
+            ep1_reclaim_after_entry2_sent INTEGER NOT NULL DEFAULT 0,
+
+            tp_max_lev_json TEXT,
 
             reporting_expired INTEGER NOT NULL DEFAULT 0,
 
@@ -185,6 +189,8 @@ def connect_db():
         "ALTER TABLE signals ADD COLUMN entry2_activated_price REAL",
         "ALTER TABLE signals ADD COLUMN tp1_rehit_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN avg_reached_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN ep1_reclaim_after_entry2_sent INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN tp_max_lev_json TEXT",
         "ALTER TABLE signals ADD COLUMN reporting_expired INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE signals ADD COLUMN sheet_row INTEGER",
     ]:
@@ -219,13 +225,14 @@ def save_signal(conn, source_message_id: int, s: dict):
             """INSERT INTO signals(
                 source_message_id, symbol, side, mode,
                 entry1_low, entry1_high, entry2_low, entry2_high,
-                tps_json, created_ts
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                tps_json, tp_max_lev_json, created_ts
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 source_message_id,
                 s["symbol"], s["side"], s["mode"],
                 s["entry1_low"], s["entry1_high"], s["entry2_low"], s["entry2_high"],
                 json.dumps(s["tps"]),
+                json.dumps([0.0] * min(20, len(s["tps"]))),
                 int(time.time())
             )
         )
@@ -243,7 +250,7 @@ def get_signal_row(conn, sid: int):
             tps_json,
             activated, activated_ts, activated_price,
             entry2_activated, entry2_activated_ts, entry2_activated_price,
-            tp_hits, reporting_expired,
+            tp_hits, tp_max_lev_json, ep1_reclaim_after_entry2_sent, reporting_expired,
             sheet_row
         FROM signals WHERE id=?""",
         (sid,)
@@ -407,7 +414,7 @@ SIGNALS_HEADERS = [
     "TPCount","TPsJson",
     "Status","Activated","ActivatedTS","ActivatedPrice",
     "Entry2Activated","Entry2ActivatedTS","Entry2ActivatedPrice",
-    "TPHits","ReportingExpired"
+    "TPHits","ReportingExpired","TP1","TP2","TP3","TP4","TP5","TP6","TP7","TP8","TP9","TP10","TP11","TP12","TP13","TP14","TP15","TP16","TP17","TP18","TP19","TP20"
 ]
 
 PROFITS_HEADERS = [
@@ -448,7 +455,7 @@ class SheetsClient:
         self._ensure_tab_headers(self.profits_tab, PROFITS_HEADERS)
 
     def _ensure_tab_headers(self, tab: str, headers: list[str]):
-        rng = f"{tab}!A1:Z1"
+        rng = f"{tab}!A1:AZ1"
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=rng
@@ -467,7 +474,7 @@ class SheetsClient:
     def append_signal_row(self, row_values: list):
         resp = self.service.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.signals_tab}!A:Z",
+            range=f"{self.signals_tab}!A:AZ",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values":[row_values]}
@@ -575,7 +582,7 @@ def _signal_status_row_values(srow) -> list:
         tps_json,
         activated, activated_ts, activated_price,
         entry2_activated, entry2_activated_ts, entry2_activated_price,
-        tp_hits, reporting_expired,
+        tp_hits, tp_max_lev_json, ep1_reclaim_after_entry2_sent, reporting_expired,
         sheet_row
     ) = srow
 
@@ -592,6 +599,12 @@ def _signal_status_row_values(srow) -> list:
             pass
 
     tps = json.loads(tps_json) if tps_json else []
+    entry_ref = None
+    try:
+        entry_ref = activated_price if activated_price is not None and activated_price != 0 else entry_ref_from_range(e1l, e1h)
+    except Exception:
+        entry_ref = activated_price if activated_price is not None else None
+    tp_fields = tp_cells_for_sheet(tps, entry_ref, side, int(tp_hits), tp_max_lev_json)
     return [
         sid,
         source_message_id,
@@ -613,7 +626,11 @@ def _signal_status_row_values(srow) -> list:
         entry2_activated_ts if entry2_activated_ts is not None else "",
         entry2_activated_price if entry2_activated_price is not None else "",
         int(tp_hits),
-        int(reporting_expired)
+        int(reporting_expired),
+        tp_fields["TP1"],tp_fields["TP2"],tp_fields["TP3"],tp_fields["TP4"],tp_fields["TP5"],
+        tp_fields["TP6"],tp_fields["TP7"],tp_fields["TP8"],tp_fields["TP9"],tp_fields["TP10"],
+        tp_fields["TP11"],tp_fields["TP12"],tp_fields["TP13"],tp_fields["TP14"],tp_fields["TP15"],
+        tp_fields["TP16"],tp_fields["TP17"],tp_fields["TP18"],tp_fields["TP19"],tp_fields["TP20"]
     ]
 
 async def gs_upsert_new_signal(conn, gs: SheetsClient | None, sid: int):
@@ -664,7 +681,7 @@ async def gs_sync_full_signal(conn, gs: SheetsClient | None, sid: int):
     # update all columns by writing whole row via update range
     # easiest: batchUpdate per cell only for known headers is heavier; full row update is simpler.
     try:
-        rng = f"{gs.signals_tab}!A{sheet_row}:U{sheet_row}"
+        rng = f"{gs.signals_tab}!A{sheet_row}:{SheetsClient._col_letter(len(SIGNALS_HEADERS))}{sheet_row}"
         await asyncio.to_thread(
             gs.service.spreadsheets().values().update(
                 spreadsheetId=gs.spreadsheet_id,
@@ -735,9 +752,11 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                     entry1_low, entry1_high, entry2_low, entry2_high,
                     tps_json, created_ts,
                     activated, activated_ts, activated_price, tp_hits,
+                    tp_max_lev_json,
                     entry2_activated, entry2_activated_ts, entry2_activated_price,
                     tp1_rehit_after_entry2_sent,
                     avg_reached_after_entry2_sent,
+                    ep1_reclaim_after_entry2_sent,
                     reporting_expired
                    FROM signals"""
             ).fetchall()
@@ -749,9 +768,11 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                 e1l, e1h, e2l, e2h,
                 tps_json, created_ts,
                 activated, activated_ts, activated_price, tp_hits,
+                tp_max_lev_json,
                 e2_activated, e2_activated_ts, e2_activated_price,
                 tp1_rehit_sent,
                 avg_reached_sent,
+                ep1_reclaim_sent,
                 reporting_expired
             ) in rows:
 
@@ -808,6 +829,13 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             "Entry2ActivatedTS": e2_activated_ts if e2_activated else "",
                             "Entry2ActivatedPrice": e2_activated_price if e2_activated else "",
                         })
+
+                        # Update TP grid baseline in Sheets (from activated entry price)
+                        try:
+                            tp_fields = tp_cells_for_sheet(tps, price, side, int(tp_hits), tp_max_lev_json)
+                            await gs_update_signal_fields(conn, gs, sid, tp_fields)
+                        except Exception as e:
+                            log(f"TP grid update (activation) error sid={sid}: {e}")
 
                         await post_target(bot,
                             "✅ Signál aktivován\n"
@@ -902,7 +930,7 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             await post_target(bot,
                                 f"🎯 {symbol} – TP1 HIT (po aktivaci 2. Entry)\n"
                                 f"Směr: {side}\n"
-                                f"Entry2: {fmt(entry2_price)}\n"
+                                f"Entry2: {fmt(e2_activated_price)}\n"
                                 f"TP1: {fmt(tp1)}\n"
                                 f"Zisk: {g2_spot:.2f}% čistého trhu ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
                             )
@@ -912,6 +940,38 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                         )
                         conn.commit()
                         tp1_rehit_sent = 1
+
+                
+                # 3.5) EP1 reclaim after Entry2 activation (update TP1 ONLY if already hit before)
+                if activated and e2_activated and (tp_hits >= 1) and (ep1_reclaim_sent == 0):
+                    try:
+                        reached_ep1 = (price >= entry1_price) if side == "LONG" else (price <= entry1_price)
+                    except Exception:
+                        reached_ep1 = False
+                    if reached_ep1 and entry1_price and e2_activated_price and e2_activated_price != 0:
+                        # Combined profit at EP1 after having EP2 active: EP1 leg is ~0, EP2 leg may be >0
+                        combined_lev_at_ep1 = pct_from_entry(entry1_price, e2_activated_price, side) * LEVERAGE
+                        n = min(20, len(tps))
+                        new_json = update_tp_max_json(tp_max_lev_json, 1, combined_lev_at_ep1, n)
+                        # Persist only if improved
+                        if new_json != (tp_max_lev_json or ""):
+                            conn.execute("UPDATE signals SET tp_max_lev_json=? WHERE id=?", (new_json, sid))
+                            conn.commit()
+                            tp_max_lev_json = new_json
+                            # Update sheet TP1 cell (keeps ✓ because tp_hits>=1)
+                            await gs_update_signal_fields(conn, gs, sid, {
+                                "TP1": "✓ " + fmt_pct_lev(load_tp_max_list(tp_max_lev_json, n)[0])
+                            })
+                            await post_target(
+                                bot,
+                                "ℹ️ Po aktivaci Entry2 jsme se vrátili na Entry1 cenu.\n"
+                                f"{symbol} ({side})\n"
+                                f"Aktuální profit z kombinované pozice (20x) na Entry1: {fmt_pct_lev(combined_lev_at_ep1)}"
+                            )
+
+                        conn.execute("UPDATE signals SET ep1_reclaim_after_entry2_sent=1 WHERE id=?", (sid,))
+                        conn.commit()
+                        ep1_reclaim_sent = 1
 
                 # 4) Normal TP hits
                 if activated:
@@ -931,6 +991,27 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             "TPHits": int(tp_hits),
                             "Status": "ENTRY2" if e2_activated else "ACTIVE"
                         })
+
+                        # Update TP high-water (combined EP1+EP2) and write TP cell
+                        try:
+                            g1_spot_tmp = pct_from_entry(tp, entry1_price, side)
+                            g1_lev_tmp = g1_spot_tmp * LEVERAGE
+                            combined_lev = g1_lev_tmp
+                            if entry2_price is not None and entry2_price != 0:
+                                combined_lev += pct_from_entry(tp, entry2_price, side) * LEVERAGE
+                            n = min(20, len(tps))
+                            new_json = update_tp_max_json(tp_max_lev_json, tp_hits, combined_lev, n)
+                            if new_json != (tp_max_lev_json or ""):
+                                conn.execute("UPDATE signals SET tp_max_lev_json=? WHERE id=?", (new_json, sid))
+                                conn.commit()
+                                tp_max_lev_json = new_json
+                            # Write TPx cell string
+                            maxs = load_tp_max_list(tp_max_lev_json, n)
+                            await gs_update_signal_fields(conn, gs, sid, {
+                                f"TP{tp_hits}": "✓ " + fmt_pct_lev(maxs[tp_hits-1])
+                            })
+                        except Exception as e:
+                            log(f"TP high-water update error sid={sid} tp={tp_hits}: {e}")
 
                         g1_spot = pct_from_entry(tp, entry1_price, side)
                         g1_lev = g1_spot * LEVERAGE
@@ -961,7 +1042,7 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             f"🎯 {symbol} – TP{tp_hits} HIT\n"
                             f"Směr: {side}\n"
                             f"Entry1: {fmt(entry1_price)}\n"
-                            f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
+                            f"{'Entry2: ' + fmt(e2_activated_price) if e2_activated_price is not None else 'Entry2: -'}\n"
                             f"TP{tp_hits}: {fmt(tp)}\n"
                             f"{profit_line}"
                         )
@@ -1099,6 +1180,14 @@ async def main_async():
                                 "ActivatedTS": now_ts,
                                 "ActivatedPrice": price_now
                             })
+
+                            # Update TP grid baseline in Sheets (from activated entry price)
+                            try:
+                                tps = s["tps"]
+                                tp_fields = tp_cells_for_sheet(tps, price_now, s["side"], 0, json.dumps([0.0] * min(20, len(tps))))
+                                await gs_update_signal_fields(conn, gs, sid, tp_fields)
+                            except Exception as e:
+                                log(f"TP grid update (MARKET activation) error sid={sid}: {e}")
 
                             await post_target(bot,
                                 "✅ Signál aktivován (MARKET)\n"
