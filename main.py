@@ -782,14 +782,16 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event, gs_state: di
 
                         # Sheets update
                         await gsheets_upsert_signal(service, conn, sid)
-            # DASH GRID (V..AR): MAX_20x, MP, TP1..TP20
-            try:
-                sr = conn.execute("SELECT sheet_row FROM signals WHERE id=?", (sid,)).fetchone()
-                srn = int(sr[0]) if sr and sr[0] else 0
-                if srn > 1:
-                    await gsheets_upsert_dash(conn, service, sid, srn, float(price))
-            except Exception as e:
-                log(f"GSHEETS dash update failed sid={sid} err={e}")
+# DASH GRID (V..AR): MAX_20x, MP, TP1..TP20
+try:
+    sr = conn.execute(
+        "SELECT sheet_row FROM signals WHERE id=?", (sid,)
+    ).fetchone()
+    srn = int(sr[0]) if sr and sr[0] else 0
+    if srn > 1:
+        await gsheets_upsert_dash(conn, service, sid, srn, float(price))
+except Exception as e:
+    log(f"GSHEETS dash update failed sid={sid} err={e}")
 
 msg = (
     "🆕 Nový signál uložen\n"
@@ -799,6 +801,7 @@ msg = (
     f"TPs (rezistenční úrovně): {len(s['tps'])}"
 )
 await post_target(bot, msg)
+
 
 
                 # After activation: enforce reporting window
@@ -1097,6 +1100,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
