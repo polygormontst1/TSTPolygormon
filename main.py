@@ -790,14 +790,15 @@ async def monitor_prices(bot: Bot, conn, stop_event: asyncio.Event, gs_state: di
             except Exception as e:
                 log(f"GSHEETS dash update failed sid={sid} err={e}")
 
+msg = (
+    "🆕 Nový signál uložen\n"
+    f"{s['symbol']} ({s['side']}) [{s['mode']}]\n"
+    f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
+    f"{entry2_line}"
+    f"TPs (rezistenční úrovně): {len(s['tps'])}"
+)
+await post_target(bot, msg)
 
-                        await post_target(bot,
-                            "✅ Signál aktivován\n"
-                            f"{symbol} ({side})\n"
-                            f"Vstup (Entry1): {fmt(price)}\n"
-                            f"Entry1: {fmt(e1l)} - {fmt(e1h)}"
-                        )
-                    continue
 
                 # After activation: enforce reporting window
                 if activated:
@@ -1095,5 +1096,6 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
