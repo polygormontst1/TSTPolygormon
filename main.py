@@ -891,6 +891,80 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             avg_reached_sent = 1
 
                 # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
+                                # 2.6) RETURN TO EP1 after Entry2 (update TP1 only if higher, + Telegram + Profits)
+                if activated and e2_activated:
+                    try:
+                        e1 = float(entry1_price) if entry1_price is not None else None
+                        e2 = float(e2_activated_price) if e2_activated_price is not None else None
+                    except Exception:
+                        e1, e2 = None, None
+
+                    if e1 and e2:
+                        # tolerance to avoid noise around EP1 (in %)
+                        tol_pct = float(os.getenv("RETURN_TO_EP1_TOL_PCT", "0.15"))  # 0.15%
+                        tol = (tol_pct / 100.0)
+
+                        # "returned to EP1" condition
+                        if side == "LONG":
+                            ep1_touch = price >= (e1 * (1.0 - tol))
+                        else:
+                            ep1_touch = price <= (e1 * (1.0 + tol))
+
+                        if ep1_touch:
+                            # current combined profit (spot + leverage) at this moment
+                            g1_spot_now = pct_from_entry(price, e1, side)
+                            g2_spot_now = pct_from_entry(price, e2, side)
+
+                            g1_lev_now = g1_spot_now * LEVERAGE
+                            g2_lev_now = g2_spot_now * LEVERAGE
+                            combined_lev_now = g1_lev_now + g2_lev_now
+
+                            # anti-spam + high-water: store last best
+                            key = f"rt_ep1_best_lev_{sid}"
+                            try:
+                                prev_best = float(state_get(conn, key, "0") or "0")
+                            except Exception:
+                                prev_best = 0.0
+
+                            # only if we made a NEW high-water (strictly higher)
+                            if combined_lev_now > (prev_best + 1e-6):
+                                # 1) Telegram message
+                                await post_target(
+                                    bot,
+                                    "🔁 Návrat na EP1 po aktivaci EP2\n"
+                                    f"{symbol} ({side})\n"
+                                    f"EP1: {fmt(e1)} | EP2: {fmt(e2)}\n"
+                                    f"Aktuální cena: {fmt(price)}\n"
+                                    f"Kombinovaný zisk: {combined_lev_now:.2f}% (páka {LEVERAGE:g}x)\n"
+                                    f"  z EP1: {g1_lev_now:.2f}% | z EP2: {g2_lev_now:.2f}%"
+                                )
+
+                                # 2) Write to Profits as TPIndex=1 special event (so Dashboard can update TP1)
+                                if gs:
+                                    try:
+                                        event_ts = int(time.time())
+                                        row = [
+                                            event_ts,
+                                            sid,
+                                            symbol,
+                                            side,
+                                            1,          # TPIndex = 1
+                                            price,      # TPPrice
+                                            e1,
+                                            round(g1_spot_now, 6),
+                                            round(g1_lev_now, 6),
+                                            e2,
+                                            round(g2_spot_now, 6),
+                                            round(g2_lev_now, 6),
+                                            "RETURN_TO_EP1"
+                                        ]
+                                        await asyncio.to_thread(gs.append_profit_event, row)
+                                    except Exception as e:
+                                        log(f"RETURN_TO_EP1 profit append error sid={sid}: {e}")
+
+                                # 3) persist new best (prevents repeated messages unless higher)
+                                state_set(conn, key, str(combined_lev_now))
+
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
                     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
@@ -1127,3 +1201,4 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
