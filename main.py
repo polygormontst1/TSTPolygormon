@@ -538,7 +538,7 @@ async def gsheets_upsert_dash(conn, service, sid: int, sheet_row: int, price_now
                 txt = "✓ " + txt
             tp_vals.append(txt)
 
-    mp_spot = pct_from_entry(price_now, float(activated_price), side) * 100.0
+    mp_spot = pct_from_entry(price_now, float(activated_price), side)
     mp_20x = mp_spot * LEVERAGE
 
     values = [""] * 23  # V..AR
@@ -792,17 +792,6 @@ try:
         await gsheets_upsert_dash(conn, service, sid, srn, float(price))
 except Exception as e:
     log(f"GSHEETS dash update failed sid={sid} err={e}")
-
-msg = (
-    "🆕 Nový signál uložen\n"
-    f"{s['symbol']} ({s['side']}) [{s['mode']}]\n"
-    f"Entry1: {fmt(s['entry1_low'])} - {fmt(s['entry1_high'])}\n"
-    f"{entry2_line}"
-    f"TPs (rezistenční úrovně): {len(s['tps'])}"
-)
-await post_target(bot, msg)
-
-
 
                 # After activation: enforce reporting window
                 if activated:
@@ -1100,6 +1089,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
