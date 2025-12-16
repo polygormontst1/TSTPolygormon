@@ -388,6 +388,7 @@ async def gsheets_init_once(state):
         log(f"GSHEETS init error: {e}")
         return None
 
+
 async def gsheets_upsert_signal(service, conn, sid: int):
     if not service:
         return
@@ -1096,6 +1097,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
