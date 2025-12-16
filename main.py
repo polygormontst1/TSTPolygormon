@@ -954,6 +954,8 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                                     f"Kombinovaný zisk: {combined_lev_now:.2f}% (páka {LEVERAGE:g}x)\n"
                                     f"  z EP1: {g1_lev_now:.2f}% | z EP2: {g2_lev_now:.2f}%"
                                 )
+                                state_set(conn, sent_key, "1")
+
 
                                 # 2) Write Profits event (TPIndex=1) so Dashboard can update TP1
                                 if gs:
@@ -1220,6 +1222,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
