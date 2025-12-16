@@ -925,7 +925,9 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                         # - we have been below EP1 at least once after EP2 (was_below==True)
                         # - we are now back to/reclaimed EP1 (reclaimed_ep1_now==True)
                         # - we haven't sent it yet (already_sent==False)
-                        if was_below and reclaimed_ep1_now and (not already_sent):
+                        if was_below and reclaimed_ep1_now and (state_get(conn, sent_key, "0") != "1"):
+
+
                             # Compute current combined profit at THIS moment (NOT historical)
                             g1_spot_now = pct_from_entry(price, e1, side)
                             g2_spot_now = pct_from_entry(price, e2, side)
@@ -1218,6 +1220,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
