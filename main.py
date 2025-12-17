@@ -890,20 +890,23 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             conn.commit()
                             avg_reached_sent = 1
 
-                       # 2.6) EP2 aktivní | návrat zpět na EP1 (pošle 1x po skutečném návratu POD->NAD)
+                   # 2.6) EP2 aktivní | Návrat na EP1 (POUZE 1x, po skutečném návratu POD -> NAD)
 if activated and e2_activated:
-    # Parse EP1/EP2 safely
+
+    # Parse EP1 / EP2 safely
     try:
         e1 = float(entry1_price) if entry1_price is not None else None
         e2 = float(e2_activated_price) if e2_activated_price is not None else None
     except Exception:
         e1, e2 = None, None
 
-    if e1 and e2:
-        tol_pct = float(os.getenv("RETURN_TO_EP1_TOL_PCT", "0.15"))  # 0.15%
+    # EP2 == EP1 → nedává smysl RETURN_TO_EP1
+    if not e1 or not e2 or abs(e1 - e2) / e1 < 0.0005:
+        pass
+    else:
+        tol_pct = float(os.getenv("RETURN_TO_EP1_TOL_PCT", "0.15"))
         tol = tol_pct / 100.0
 
-        # Define "below EP1" and "reclaimed EP1" with tolerance (anti-noise)
         if side == "LONG":
             below_ep1_now = price < (e1 * (1.0 - tol))
             reclaimed_ep1_now = price >= (e1 * (1.0 - tol))
@@ -918,71 +921,61 @@ if activated and e2_activated:
         was_below = (state_get(conn, cross_key, "0") == "1")
         already_sent = (state_get(conn, sent_key, "0") == "1")
 
-        # Track that we have been meaningfully below EP1 at least once after EP2
         if below_ep1_now:
             state_set(conn, cross_key, "1")
 
-        # Fire ONLY ONCE: after we were below EP1, and now reclaimed EP1
-        if was_below and reclaimed_ep1_now and (not already_sent):
-            # Compute combined profit at THIS moment
-            g1_spot_now = pct_from_entry(price, e1, side)
-            g2_spot_now = pct_from_entry(price, e2, side)
+        if was_below and reclaimed_ep1_now and not already_sent:
 
-            g1_lev_now = g1_spot_now * LEVERAGE
-            g2_lev_now = g2_spot_now * LEVERAGE
-            combined_lev_now = g1_lev_now + g2_lev_now
+            g1_spot = pct_from_entry(price, e1, side)
+            g2_spot = pct_from_entry(price, e2, side)
 
-            # Only send + write profits if this improves "best" (so TP1 overwrite makes sense)
+            g1_lev = g1_spot * LEVERAGE
+            g2_lev = g2_spot * LEVERAGE
+            combined_lev = g1_lev + g2_lev
+
             try:
                 prev_best = float(state_get(conn, best_key, "0") or "0")
             except Exception:
                 prev_best = 0.0
 
-            if combined_lev_now > (prev_best + 1e-6):
-                # Mark sent FIRST (anti-spam even if loop runs again immediately)
-                state_set(conn, sent_key, "1")
+            if combined_lev > prev_best + 1e-6:
 
-                # Telegram message (1x)
+                # Telegram
                 await post_target(
                     bot,
-                    "🔁 Návrat na EP1 po aktivaci EP2\n"
+                    "🔁 EP2 aktivní | Návrat na EP1\n"
                     f"{symbol} ({side})\n"
                     f"EP1: {fmt(e1)} | EP2: {fmt(e2)}\n"
                     f"Aktuální cena: {fmt(price)}\n"
-                    f"Kombinovaný zisk: {combined_lev_now:.2f}% (páka {LEVERAGE:g}x)\n"
-                    f"  část EP1: {g1_lev_now:.2f}% | část EP2: {g2_lev_now:.2f}%"
+                    f"Kombinovaný zisk: {combined_lev:.2f}% (páka {LEVERAGE}x)\n"
+                    f"  z EP1: {g1_lev:.2f}% | z EP2: {g2_lev:.2f}%"
                 )
 
-                # Write Profits event (TPIndex=1) so Dashboard can update TP1
+                # Profits (TP1 overwrite)
                 if gs:
                     try:
-                        event_ts = int(time.time())
                         row = [
-                            event_ts,
+                            int(time.time()),
                             sid,
                             symbol,
                             side,
-                            1,          # TPIndex = 1
-                            price,      # TPPrice
+                            1,
+                            price,
                             e1,
-                            round(g1_spot_now, 6),
-                            round(g1_lev_now, 6),
+                            round(g1_spot, 6),
+                            round(g1_lev, 6),
                             e2,
-                            round(g2_spot_now, 6),
-                            round(g2_lev_now, 6),
+                            round(g2_spot, 6),
+                            round(g2_lev, 6),
                             "RETURN_TO_EP1"
                         ]
                         await asyncio.to_thread(gs.append_profit_event, row)
                     except Exception as e:
-                        log(f"RETURN_TO_EP1 profit append error sid={sid}: {e}")
+                        log(f"RETURN_TO_EP1 append error sid={sid}: {e}")
 
-                # Persist best (so we don't overwrite TP1 with worse)
-                state_set(conn, best_key, str(combined_lev_now))
+                state_set(conn, best_key, str(combined_lev))
+                state_set(conn, sent_key, "1")
 
-
-                                # 3) Persist best + mark as sent (anti-spam)
-                                state_set(conn, best_key, str(combined_lev_now))
-                                state_set(conn, sent_key, "1")
                                 
 # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
 
@@ -1222,6 +1215,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
