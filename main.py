@@ -890,96 +890,7 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             conn.commit()
                             avg_reached_sent = 1
 
-       # 2.6) EP2 aktivní | Návrat na EP1 (POUZE 1x, po skutečném návratu POD -> NAD)
-if activated and e2_activated:
-    # Parse EP1 / EP2 safely
-    try:
-        e1 = float(entry1_price) if entry1_price is not None else None
-        e2 = float(e2_activated_price) if e2_activated_price is not None else None
-    except Exception:
-        e1, e2 = None, None
-
-    # EP2 == EP1 -> nedává smysl RETURN_TO_EP1
-    if not e1 or not e2 or abs(e1 - e2) / (e1 if e1 else 1.0) < 0.0005:
-        pass
-    else:
-        tol_pct = float(os.getenv("RETURN_TO_EP1_TOL_PCT", "0.15"))  # 0.15%
-        tol = tol_pct / 100.0
-
-        # Define "below EP1" and "reclaimed EP1"
-        if side == "LONG":
-            below_ep1_now = price < (e1 * (1.0 - tol))
-            reclaimed_ep1_now = price >= (e1 * (1.0 - tol))
-        else:
-            below_ep1_now = price > (e1 * (1.0 + tol))
-            reclaimed_ep1_now = price <= (e1 * (1.0 + tol))
-
-        cross_key = f"rt_ep1_was_below_{sid}"
-        sent_key  = f"rt_ep1_sent_{sid}"
-
-        # Track: byli jsme po EP2 někdy reálně pod EP1?
-        if below_ep1_now:
-            state_set(conn, cross_key, "1")
-
-        was_below = (state_get(conn, cross_key, "0") == "1")
-        already_sent = (state_get(conn, sent_key, "0") == "1")
-
-        # Fire ONLY ONCE: až když jsme byli POD EP1 a pak se vrátili NAD EP1
-        if was_below and reclaimed_ep1_now and (not already_sent):
-            # anti-spam okamžitě (aby se to neposlalo víckrát v jednom cyklu)
-            state_set(conn, sent_key, "1")
-
-            # aktuální profit v momentě návratu (NE historický TP1)
-            g1_spot_now = pct_from_entry(price, e1, side)
-            g2_spot_now = pct_from_entry(price, e2, side)
-            g1_lev_now = g1_spot_now * LEVERAGE
-            g2_lev_now = g2_spot_now * LEVERAGE
-            combined_lev_now = g1_lev_now + g2_lev_now
-
-            # Telegram
-            await post_target(
-                bot,
-                "🔁 Návrat na EP1 po aktivaci EP2\n"
-                f"{symbol} ({side})\n"
-                f"EP1: {fmt(e1)} | EP2: {fmt(e2)}\n"
-                f"Aktuální cena: {fmt(price)}\n"
-                f"Kombinovaný zisk: {combined_lev_now:.2f}% (páka {LEVERAGE:g}x)\n"
-                f"  z EP1: {g1_lev_now:.2f}% | z EP2: {g2_lev_now:.2f}%"
-            )
-
-            # Profits event pro dashboard (TPIndex=1, reason=RETURN_TO_EP1)
-            if gs:
-                try:
-                    event_ts = int(time.time())
-                    row = [
-                        event_ts,
-                        sid,
-                        symbol,
-                        side,
-                        1,              # TPIndex = 1
-                        price,          # TPPrice (cena v momentě návratu na EP1)
-                        e1,
-                        round(g1_spot_now, 6),
-                        round(g1_lev_now, 6),
-                        e2,
-                        round(g2_spot_now, 6),
-                        round(g2_lev_now, 6),
-                        "RETURN_TO_EP1"
-                    ]
-                    await asyncio.to_thread(gs.append_profit_event, row)
-                except Exception as e:
-                    log(f"RETURN_TO_EP1 profit append error sid={sid}: {e}")
-
-            # Persist flag i do signals tabulky (máš ten sloupec)
-            try:
-                conn.execute("UPDATE signals SET ep1_reclaim_after_entry2_sent=1 WHERE id=?", (sid,))
-                conn.commit()
-            except Exception:
-                pass
-
-                                
-# 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
-
+                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
                     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
@@ -1216,11 +1127,3 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
-
-
-
-
-
-
-
-
