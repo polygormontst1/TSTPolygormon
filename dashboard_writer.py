@@ -336,7 +336,7 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
                 sumv = v1 + v2
                 if sumv > base:
                     outv = sumv
-                    tag = "(SUM)"
+                    tag = "(s 2EP)"
 
             row.append(fmt_tp_cell(outv, tag))
 
@@ -348,7 +348,7 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
             s = max_e1[sid] + max_e2[sid]
             if (max_base is None) or (s > max_base):
                 max_out = s
-                max_tag = "(SUM)"
+                max_tag = "(s 2EP)"
 
         max_cell = (f"{max_out:.1f}% {max_tag}" if (max_out is not None and max_tag) else fmt_pct(max_out))
 
