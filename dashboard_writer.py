@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # dashboard_writer.py
-# Reads Signals + Profits from Google Sheets and writes a clean member-facing dataset to _DASH_DATA.
-# FIX: correct TP profit mapping + decimal comma parsing + EP2 gating (no E1+E2 summing)
+# FIX: TP cells can be EP1-only (dark) or EP1+EP2 combined (light) marked with "(SUM)"
+# FIX: ignore Profits rows with Note containing "RETURN" (e.g., RETURN_TO_EP1)
+# NOTE: decimal comma supported
 
 import os
 import time
@@ -27,11 +28,7 @@ GSHEET_PROFITS_TAB = os.getenv("GSHEET_PROFITS_TAB", "Profits").strip()
 GSHEET_DASHDATA_TAB = os.getenv("GSHEET_DASHDATA_TAB", "_DASH_DATA").strip()
 
 DASH_ROWS = int(os.getenv("DASH_ROWS", "30"))
-
-# optional – if you want MP/EP1 and MP; if missing/unreachable, MP fields will just be blank
 PROXY_PRICE_URL = os.getenv("PROXY_PRICE_URL", "").strip().rstrip("/")
-
-# loop interval for Render worker
 WRITER_INTERVAL_SEC = int(os.getenv("WRITER_INTERVAL_SEC", "120"))
 
 
@@ -105,9 +102,14 @@ def fmt_pct(x):
     return f"{x:.1f}%"
 
 
-def fmt_tp_cell(x):
+def fmt_tp_cell(x, tag: str | None = None):
+    """
+    If tag == "(SUM)", we mark combined EP1+EP2 TP so Sheets can color it safely.
+    """
     if x is None:
         return ""
+    if tag:
+        return f"✓ {x:.1f}% {tag}"
     return f"✓ {x:.1f}%"
 
 
@@ -185,7 +187,7 @@ def ensure_header(service):
 def build_profit_maps(profit_headers, profit_rows):
     """
     Build per-signal per-TP maxima for E1 and E2 profits separately.
-    We DO NOT sum E1+E2.
+    Ignore rows where Note contains "RETURN" (these are not TP hits).
     """
     idx = {h: i for i, h in enumerate(profit_headers)}
 
@@ -194,12 +196,20 @@ def build_profit_maps(profit_headers, profit_rows):
         log(f"Profits headers missing some of {req}. Found={profit_headers}")
         return {}, {}, {}, {}
 
+    note_i = idx.get("Note", None)
+
     tp_max_e1 = {}  # {sid: {tp: max_e1}}
     tp_max_e2 = {}  # {sid: {tp: max_e2}}
     max_e1 = {}     # {sid: max_e1_any_tp}
     max_e2 = {}     # {sid: max_e2_any_tp}
 
     for row in profit_rows:
+        # filter non-TP events like RETURN_TO_EP1
+        if note_i is not None and note_i < len(row):
+            note = str(row[note_i]).strip().upper()
+            if "RETURN" in note:
+                continue
+
         sid = str(row[idx["SignalID"]] if idx["SignalID"] < len(row) else "").strip()
         if not sid:
             continue
@@ -306,26 +316,43 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
         tpmap1 = tp_max_e1.get(sid, {})
         tpmap2 = tp_max_e2.get(sid, {})
 
+        # YOUR RULE:
+        # - default TP is EP1-only (dark)
+        # - if EP2 active AND (EP1 + EP2) beats EP1-only => write combined and mark "(SUM)" (light)
         for i in range(1, 21):
-            v1 = tpmap1.get(i)
-            v2 = tpmap2.get(i)
+            v1 = tpmap1.get(i)  # EP1-only profit
+            v2 = tpmap2.get(i)  # EP2 profit (for same TP)
 
-            if e2_act:
-                candidates = [x for x in (v1, v2) if x is not None]
-                v = max(candidates) if candidates else None
-            else:
-                v = v1
+            if v1 is None and v2 is None:
+                row.append("")
+                continue
 
-            row.append(fmt_tp_cell(v) if v is not None else "")
+            # baseline: EP1-only if present, else fallback to EP2-only
+            base = v1 if v1 is not None else v2
+            tag = None
+            outv = base
 
-        # Max column: same gating logic
-        if e2_act:
-            candidates = [x for x in (max_e1.get(sid), max_e2.get(sid)) if x is not None]
-            maxv = max(candidates) if candidates else None
-        else:
-            maxv = max_e1.get(sid)
+            if e2_act and (v1 is not None) and (v2 is not None):
+                sumv = v1 + v2
+                if sumv > base:
+                    outv = sumv
+                    tag = "(SUM)"
 
-        row += ["", "", "", "", fmt_pct(maxv), "", note, status if status else ("ACTIVE" if activated else "WAIT")]
+            row.append(fmt_tp_cell(outv, tag))
+
+        # "Max" column: keep simple (EP1-only max, or combined if it beats it)
+        max_base = max_e1.get(sid)
+        max_tag = None
+        max_out = max_base
+        if e2_act and (max_e1.get(sid) is not None) and (max_e2.get(sid) is not None):
+            s = max_e1[sid] + max_e2[sid]
+            if (max_base is None) or (s > max_base):
+                max_out = s
+                max_tag = "(SUM)"
+
+        max_cell = (f"{max_out:.1f}% {max_tag}" if (max_out is not None and max_tag) else fmt_pct(max_out))
+
+        row += ["", "", "", "", max_cell, "", note, status if status else ("ACTIVE" if activated else "WAIT")]
         out.append(row)
 
     return out
@@ -343,7 +370,6 @@ def main_once():
     last_rows, sidx = pick_last_signals(sh, sr, DASH_ROWS)
     dash_rows = build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2)
 
-    # Clear old rows (keep header). Total columns = 9 base + 20 TP + 8 tail = 37 columns.
     width = 9 + 20 + 8
     end_col = col_letter(width)
     clear_rng = f"{GSHEET_DASHDATA_TAB}!A2:{end_col}2000"
