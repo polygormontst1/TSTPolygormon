@@ -9,9 +9,6 @@ import base64
 import datetime
 import requests
 
-log("### WRITER VERSION: TP_FIX_V1 ###")
-
-
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
