@@ -917,20 +917,30 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                 if activated:
                     entry2_price = e2_activated_price if e2_activated else None
 
-                    while tp_hits < len(tps):
-                        tp = float(tps[tp_hits])
-                        is_hit = (price >= tp) if side == "LONG" else (price <= tp)
-                        if not is_hit:
-                            break
+while tp_hits < len(tps):
+    tp = float(tps[tp_hits])
 
-                        tp_hits += 1
-                        conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
-                        conn.commit()
+    # ✅ PROFIT CHECK – zabrání TP se ztrátou (hlavně SHORT)
+    g1_spot_check = pct_from_entry(tp, entry1_price, side)
+    if g1_spot_check <= 0:
+    break
 
-                        await gs_update_signal_fields(conn, gs, sid, {
-                            "TPHits": int(tp_hits),
-                            "Status": "ENTRY2" if e2_activated else "ACTIVE"
-                        })
+    is_hit = (price >= tp) if side == "LONG" else (price <= tp)
+    if not is_hit:
+        break
+
+    tp_hits += 1
+    conn.execute(
+        "UPDATE signals SET tp_hits=? WHERE id=?",
+        (tp_hits, sid)
+    )
+    conn.commit()
+
+    await gs_update_signal_fields(conn, gs, sid, {
+        "TPHits": int(tp_hits),
+        "Status": "ENTRY2" if e2_activated else "ACTIVE"
+    })
+
 
                         g1_spot = pct_from_entry(tp, entry1_price, side)
                         g1_lev = g1_spot * LEVERAGE
@@ -1127,3 +1137,4 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
