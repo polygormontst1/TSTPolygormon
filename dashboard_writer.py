@@ -9,6 +9,9 @@ import base64
 import datetime
 import requests
 
+log("### WRITER VERSION: TP_FIX_V1 ###")
+
+
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -39,10 +42,15 @@ def safe_float(x):
     try:
         if x is None:
             return None
-        s = str(x).replace("%", "").replace("✓", "").strip()
+        s = str(x)
+        s = s.replace("✓", "").replace("%", "").strip()
+        s = s.replace(",", ".")
+        if s == "":
+            return None
         return float(s)
     except Exception:
         return None
+
 
 
 def fmt_price(x):
