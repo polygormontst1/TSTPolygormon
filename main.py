@@ -919,21 +919,12 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
 
                     while tp_hits < len(tps):
                         tp = float(tps[tp_hits])
-
-                        # PROFIT CHECK – nikdy nezapisuj ztrátový / nulový TP
-                        g1_spot_check = pct_from_entry(tp, entry1_price, side)
-                        if g1_spot_check <= 0:
-                            break
-
                         is_hit = (price >= tp) if side == "LONG" else (price <= tp)
                         if not is_hit:
                             break
 
                         tp_hits += 1
-                        conn.execute(
-                            "UPDATE signals SET tp_hits=? WHERE id=?",
-                            (tp_hits, sid)
-                        )
+                        conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
                         conn.commit()
 
                         await gs_update_signal_fields(conn, gs, sid, {
@@ -945,9 +936,15 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                         g1_lev = g1_spot * LEVERAGE
 
                         g2_spot = g2_lev = None
-                        if entry2_price is not None:
+                        if entry2_price is not None and entry2_price != 0:
                             g2_spot = pct_from_entry(tp, entry2_price, side)
                             g2_lev = g2_spot * LEVERAGE
+                            profit_line = (
+                                f"Zisk: {g1_spot:.2f}% ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
+                                f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
+                            )
+                        else:
+                            profit_line = f"Zisk: {g1_spot:.2f}% čistého trhu ({g1_lev:.2f}% s pákou {LEVERAGE:g}x)"
 
                         await gs_append_profit(
                             conn, gs, sid,
@@ -966,10 +963,8 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             f"Entry1: {fmt(entry1_price)}\n"
                             f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
                             f"TP{tp_hits}: {fmt(tp)}\n"
-                            f"Zisk: {g1_spot:.2f}% čistého trhu ({g1_lev:.2f}% s pákou {LEVERAGE:g}x)"
+                            f"{profit_line}"
                         )
-
-
 
         except Exception as e:
             log(f"monitor_prices loop error: {e}")
@@ -995,16 +990,10 @@ async def main_async():
     log(f"LOCK: ttl={LOCK_TTL_SEC}s renew_every={LOCK_RENEW_EVERY_SEC}s")
     log(f"GSHEETS: env detected (id={GSHEET_ID} tabs={GSHEET_SIGNALS_TAB},{GSHEET_PROFITS_TAB})" if GSHEETS_ENABLED else "GSHEETS: disabled (missing env vars)")
 
-bot = Bot(token=BOT_TOKEN)
-conn = connect_db()
+    bot = Bot(token=BOT_TOKEN)
+    conn = connect_db()
 
-# FORCE UNLOCK – RUN ONCE
-conn.execute("DELETE FROM state WHERE k IN ('instance_lock_owner','instance_lock_until')")
-conn.commit()
-log("FORCE UNLOCK DONE")
-
-gs = await gs_init_once()
-
+    gs = await gs_init_once()
 
     # Leader election loop
     while True:
@@ -1138,8 +1127,3 @@ gs = await gs_init_once()
 
 if __name__ == "__main__":
     asyncio.run(main_async())
-
-
-
-
-
