@@ -914,61 +914,74 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                         tp1_rehit_sent = 1
 
                 # 4) Normal TP hits
-if activated:
-    entry2_price = e2_activated_price if e2_activated else None
-
-    while tp_hits < len(tps):
-        tp = float(tps[tp_hits])
-
-        # PROFIT CHECK – zabrání TP se ztrátou (hlavně SHORT)
-        g1_spot_check = pct_from_entry(tp, entry1_price, side)
-        if g1_spot_check <= 0:
-            break
-
-        is_hit = (price >= tp) if side == "LONG" else (price <= tp)
-        if not is_hit:
-            break
-
-        tp_hits += 1
-        conn.execute(
-            "UPDATE signals SET tp_hits=? WHERE id=?",
-            (tp_hits, sid)
-        )
-        conn.commit()
-
-        await gs_update_signal_fields(conn, gs, sid, {
-            "TPHits": int(tp_hits),
-            "Status": "ENTRY2" if e2_activated else "ACTIVE"
-        })
-
-        g1_spot = pct_from_entry(tp, entry1_price, side)
-        g1_lev = g1_spot * LEVERAGE
-
-        g2_spot = g2_lev = None
-        if entry2_price is not None:
-            g2_spot = pct_from_entry(tp, entry2_price, side)
-            g2_lev = g2_spot * LEVERAGE
-
-        await gs_append_profit(
-            conn, gs, sid,
-            tp_index=tp_hits,
-            tp_price=tp,
-            entry1_price=entry1_price,
-            entry2_price=entry2_price,
-            g1_spot=g1_spot, g1_lev=g1_lev,
-            g2_spot=g2_spot, g2_lev=g2_lev,
-            note=""
-        )
-
-
-                        await post_target(bot,
-                            f"🎯 {symbol} – TP{tp_hits} HIT\n"
-                            f"Směr: {side}\n"
-                            f"Entry1: {fmt(entry1_price)}\n"
-                            f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
-                            f"TP{tp_hits}: {fmt(tp)}\n"
-                            f"{profit_line}"
-                        )
+                if activated:
+                        entry2_price = e2_activated_price if e2_activated else None
+    
+                        while tp_hits < len(tps):
+                            tp = float(tps[tp_hits])
+    
+                            # ✅ PROFIT CHECK – žádný TP event, pokud by byl ztrátový / nulový
+                            g1_spot_check = pct_from_entry(tp, entry1_price, side)
+                            if g1_spot_check <= 0:
+                                break
+    
+                            is_hit = (price >= tp) if side == "LONG" else (price <= tp)
+                            if not is_hit:
+                                break
+    
+                            tp_hits += 1
+                            conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
+                            conn.commit()
+    
+                            await gs_update_signal_fields(conn, gs, sid, {
+                                "TPHits": int(tp_hits),
+                                "Status": "ENTRY2" if e2_activated else "ACTIVE"
+                            })
+    
+                            g1_spot = pct_from_entry(tp, entry1_price, side)
+                            g1_lev = g1_spot * LEVERAGE
+    
+                            g2_spot = g2_lev = None
+                            if entry2_price is not None and entry2_price != 0:
+                                g2_spot = pct_from_entry(tp, entry2_price, side)
+                                g2_lev = g2_spot * LEVERAGE
+                                profit_line = (
+                                    f"Zisk: {g1_spot:.2f}% ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
+                                    f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
+                                )
+                            else:
+                                profit_line = f"Zisk: {g1_spot:.2f}% čistého trhu ({g1_lev:.2f}% s pákou {LEVERAGE:g}x)"
+    
+                            await gs_append_profit(
+                                conn, gs, sid,
+                                tp_index=tp_hits,
+                                tp_price=tp,
+                                entry1_price=entry1_price,
+                                entry2_price=entry2_price,
+                                g1_spot=g1_spot, g1_lev=g1_lev,
+                                g2_spot=g2_spot, g2_lev=g2_lev,
+                                note=""
+                            )
+    
+                            await post_target(bot,
+                                f"🎯 {symbol} – TP{tp_hits} HIT\n"
+                                f"Směr: {side}\n"
+                                f"Entry1: {fmt(entry1_price)}\n"
+                                f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
+                                f"TP{tp_hits}: {fmt(tp)}\n"
+                                f"{profit_line}"
+                            )
+    
+    
+    
+                            await post_target(bot,
+                                f"🎯 {symbol} – TP{tp_hits} HIT\n"
+                                f"Směr: {side}\n"
+                                f"Entry1: {fmt(entry1_price)}\n"
+                                f"{'Entry2: ' + fmt(entry2_price) if entry2_price is not None else 'Entry2: -'}\n"
+                                f"TP{tp_hits}: {fmt(tp)}\n"
+                                f"{profit_line}"
+                            )
 
         except Exception as e:
             log(f"monitor_prices loop error: {e}")
@@ -1131,5 +1144,6 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
