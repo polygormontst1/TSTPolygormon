@@ -995,10 +995,16 @@ async def main_async():
     log(f"LOCK: ttl={LOCK_TTL_SEC}s renew_every={LOCK_RENEW_EVERY_SEC}s")
     log(f"GSHEETS: env detected (id={GSHEET_ID} tabs={GSHEET_SIGNALS_TAB},{GSHEET_PROFITS_TAB})" if GSHEETS_ENABLED else "GSHEETS: disabled (missing env vars)")
 
-    bot = Bot(token=BOT_TOKEN)
-    conn = connect_db()
+bot = Bot(token=BOT_TOKEN)
+conn = connect_db()
 
-    gs = await gs_init_once()
+# FORCE UNLOCK – RUN ONCE
+conn.execute("DELETE FROM state WHERE k IN ('instance_lock_owner','instance_lock_until')")
+conn.commit()
+log("FORCE UNLOCK DONE")
+
+gs = await gs_init_once()
+
 
     # Leader election loop
     while True:
@@ -1132,6 +1138,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
