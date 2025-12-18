@@ -338,12 +338,13 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
                     outv = sumv
                     tag = "(s 2EP)"
 
-           TH = 1.0  # minimum TP profit to display (%)
+            TH = 1.0  # minimum TP profit to display (%)
 
-if outv is None or outv < TH:
-    row.append("")
-else:
-    row.append(fmt_tp_cell(outv, tag))
+            if outv is None or outv < TH:
+                row.append("")
+            else:
+                row.append(fmt_tp_cell(outv, tag))
+
 
 
         # "Max" column: keep simple (EP1-only max, or combined if it beats it)
