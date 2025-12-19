@@ -234,22 +234,30 @@ def build_profit_maps(profit_headers, profit_rows):
         if tp < 1 or tp > 20:
             continue
 
-        # prefer leveraged values, fallback to spot * leverage
-        p1 = None
-        p2 = None
+        # ---- pick p1/p2: robust handling (some rows store SPOT inside Lev columns) ----
+        s1 = safe_float(row[spot_e1_i]) if (spot_e1_i is not None and spot_e1_i < len(row)) else None
+        s2 = safe_float(row[spot_e2_i]) if (spot_e2_i is not None and spot_e2_i < len(row)) else None
 
-        if lev_e1_i is not None and lev_e1_i < len(row):
-            p1 = safe_float(row[lev_e1_i])
-        if lev_e2_i is not None and lev_e2_i < len(row):
-            p2 = safe_float(row[lev_e2_i])
+        p1_lev = safe_float(row[lev_e1_i]) if (lev_e1_i is not None and lev_e1_i < len(row)) else None
+        p2_lev = safe_float(row[lev_e2_i]) if (lev_e2_i is not None and lev_e2_i < len(row)) else None
 
-        if p1 is None and spot_e1_i is not None and spot_e1_i < len(row):
-            s1 = safe_float(row[spot_e1_i])
-            p1 = (s1 * LEVERAGE) if s1 is not None else None
+        # default: use leveraged if it looks leveraged, otherwise compute from spot
+        p1 = p1_lev
+        p2 = p2_lev
 
-        if p2 is None and spot_e2_i is not None and spot_e2_i < len(row):
-            s2 = safe_float(row[spot_e2_i])
-            p2 = (s2 * LEVERAGE) if s2 is not None else None
+        # If both exist and Lev == Spot (or very close), it's actually spot -> convert to leverage
+        if p1 is not None and s1 is not None and abs(p1 - s1) < 1e-6:
+            p1 = s1 * LEVERAGE
+        if p2 is not None and s2 is not None and abs(p2 - s2) < 1e-6:
+            p2 = s2 * LEVERAGE
+
+        # If Lev missing -> compute from spot
+        if p1 is None and s1 is not None:
+            p1 = s1 * LEVERAGE
+        if p2 is None and s2 is not None:
+            p2 = s2 * LEVERAGE
+        # ---------------------------------------------------------------------------
+
 
         if p1 is not None:
             tp_max_e1.setdefault(sid, {})
