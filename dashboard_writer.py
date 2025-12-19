@@ -177,7 +177,7 @@ def ensure_header(service):
     if existing and existing[0] and str(existing[0][0]).strip().lower() in ("datum", "date"):
         return
 
-    headers = ["Datum", "Prefix", "Dir.", "Coin", "Quote", "EP1", "EP2", "MP/EP1", "MP"]
+    headers = ["SignalID", "Datum", "Prefix", "Dir.", "Coin", "Quote", "EP1", "EP2", "MP/EP1", "MP"]
     headers += [f"TP{i}" for i in range(1, 21)]
     headers += ["Doba", "SL1", "SL2", "Min", "Max", "Link", "Note", "Status"]
     update_values(service, f"{GSHEET_DASHDATA_TAB}!A1", [headers])
