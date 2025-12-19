@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # dashboard_writer.py
-# FIX: TP cells can be EP1-only (dark) or EP1+EP2 combined (light) marked with "(SUM)"
+# FIX: TP cells can be EP1-only (dark) or EP1+EP2 combined (light) marked with "(s 2EP)"
 # FIX: ignore Profits rows with Note containing "RETURN" (e.g., RETURN_TO_EP1)
+# FIX: TP1–TP20 must be LEVERAGED (20x): prefer ProfitLevPct_* else ProfitSpotPct_* * 20
 # NOTE: decimal comma supported
 
 import os
@@ -30,6 +31,8 @@ GSHEET_DASHDATA_TAB = os.getenv("GSHEET_DASHDATA_TAB", "_DASH_DATA").strip()
 DASH_ROWS = int(os.getenv("DASH_ROWS", "30"))
 PROXY_PRICE_URL = os.getenv("PROXY_PRICE_URL", "").strip().rstrip("/")
 WRITER_INTERVAL_SEC = int(os.getenv("WRITER_INTERVAL_SEC", "120"))
+
+LEVERAGE = float(os.getenv("LEVERAGE", "20"))  # default 20x
 
 
 # ========= HELPERS =========
@@ -103,9 +106,6 @@ def fmt_pct(x):
 
 
 def fmt_tp_cell(x, tag: str | None = None):
-    """
-    If tag == "(SUM)", we mark combined EP1+EP2 TP so Sheets can color it safely.
-    """
     if x is None:
         return ""
     if tag:
@@ -174,8 +174,11 @@ def read_profits(service):
 
 def ensure_header(service):
     existing = get_values(service, f"{GSHEET_DASHDATA_TAB}!A1:AZ1")
-    if existing and existing[0] and str(existing[0][0]).strip().lower() in ("datum", "date"):
-        return
+    # your sheet header starts with "SignalID", NOT "Datum"
+    if existing and existing[0]:
+        first = str(existing[0][0]).strip().lower()
+        if first in ("signalid", "signal_id"):
+            return
 
     headers = ["SignalID", "Datum", "Prefix", "Dir.", "Coin", "Quote", "EP1", "EP2", "MP/EP1", "MP"]
     headers += [f"TP{i}" for i in range(1, 21)]
@@ -188,26 +191,22 @@ def build_profit_maps(profit_headers, profit_rows):
     """
     Build per-signal per-TP maxima for E1 and E2 profits.
     Prefer ProfitLevPct_* (already leveraged) if present.
-    Otherwise fallback to ProfitSpotPct_* * 20.
+    Otherwise fallback to ProfitSpotPct_* * LEVERAGE.
     Ignore rows where Note contains "RETURN".
     """
     idx = {h: i for i, h in enumerate(profit_headers)}
 
-    # must-have
     for must in ["SignalID", "TPIndex"]:
         if must not in idx:
             log(f"Profits headers missing '{must}'. Found={profit_headers}")
             return {}, {}, {}, {}
 
-    note_i = idx.get("Note", None)
+    note_i = idx.get("Note")
 
-    # optional columns
-    lev_e1_i = idx.get("ProfitLevPct_E1", None)
-    lev_e2_i = idx.get("ProfitLevPct_E2", None)
-    spot_e1_i = idx.get("ProfitSpotPct_E1", None)
-    spot_e2_i = idx.get("ProfitSpotPct_E2", None)
-
-    LEVERAGE = 20.0
+    lev_e1_i = idx.get("ProfitLevPct_E1")
+    lev_e2_i = idx.get("ProfitLevPct_E2")
+    spot_e1_i = idx.get("ProfitSpotPct_E1")
+    spot_e2_i = idx.get("ProfitSpotPct_E2")
 
     tp_max_e1 = {}  # {sid: {tp: max_p1}}
     tp_max_e2 = {}  # {sid: {tp: max_p2}}
@@ -231,7 +230,11 @@ def build_profit_maps(profit_headers, profit_rows):
         except Exception:
             continue
 
-        # ---- pick p1/p2: prefer leveraged cols, fallback to spot*20 ----
+        # keep only TP1..TP20 (dashboard has 20 columns)
+        if tp < 1 or tp > 20:
+            continue
+
+        # prefer leveraged values, fallback to spot * leverage
         p1 = None
         p2 = None
 
@@ -247,7 +250,6 @@ def build_profit_maps(profit_headers, profit_rows):
         if p2 is None and spot_e2_i is not None and spot_e2_i < len(row):
             s2 = safe_float(row[spot_e2_i])
             p2 = (s2 * LEVERAGE) if s2 is not None else None
-        # --------------------------------------------------------------
 
         if p1 is not None:
             tp_max_e1.setdefault(sid, {})
@@ -328,7 +330,7 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
         note = "✓ EP2" if e2_act else ""
 
         row = [
-            sid,  # SignalID
+            sid,
             dt_from_ts(created_ts_i),
             prefix,
             dir_disp,
@@ -343,21 +345,22 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
         tpmap1 = tp_max_e1.get(sid, {})
         tpmap2 = tp_max_e2.get(sid, {})
 
-        # YOUR RULE:
-        # - default TP is EP1-only (dark)
-        # - if EP2 active AND (EP1 + EP2) beats EP1-only => write combined and mark "(SUM)" (light)
+        # RULE:
+        # - default TP is EP1-only
+        # - if EP2 active AND (EP1 + EP2) beats EP1-only => write combined and mark "(s 2EP)"
+        TH = 0.05  # minimum TP profit to display (%)
+
         for i in range(1, 21):
-            v1 = tpmap1.get(i)  # EP1-only profit
-            v2 = tpmap2.get(i)  # EP2 profit (for same TP)
+            v1 = tpmap1.get(i)
+            v2 = tpmap2.get(i)
 
             if v1 is None and v2 is None:
                 row.append("")
                 continue
 
-            # baseline: EP1-only if present, else fallback to EP2-only
             base = v1 if v1 is not None else v2
-            tag = None
             outv = base
+            tag = None
 
             if e2_act and (v1 is not None) and (v2 is not None):
                 sumv = v1 + v2
@@ -365,19 +368,16 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
                     outv = sumv
                     tag = "(s 2EP)"
 
-            TH = 0.05  # minimum TP profit to display (%)
-
             if outv is None or outv < TH:
                 row.append("")
             else:
                 row.append(fmt_tp_cell(outv, tag))
 
-
-
-        # "Max" column: keep simple (EP1-only max, or combined if it beats it)
+        # "Max" column: EP1-only max, or EP1+EP2 if it beats it
         max_base = max_e1.get(sid)
         max_tag = None
         max_out = max_base
+
         if e2_act and (max_e1.get(sid) is not None) and (max_e2.get(sid) is not None):
             s = max_e1[sid] + max_e2[sid]
             if (max_base is None) or (s > max_base):
@@ -404,8 +404,10 @@ def main_once():
     last_rows, sidx = pick_last_signals(sh, sr, DASH_ROWS)
     dash_rows = build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2)
 
-    width = 9 + 20 + 8
+    # base cols = 10, TP cols = 20, tail cols = 8  => 38 cols total
+    width = 10 + 20 + 8
     end_col = col_letter(width)
+
     clear_rng = f"{GSHEET_DASHDATA_TAB}!A2:{end_col}2000"
     service.spreadsheets().values().clear(spreadsheetId=GSHEET_ID, range=clear_rng, body={}).execute()
 
