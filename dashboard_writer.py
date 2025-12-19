@@ -302,6 +302,7 @@ def build_dash_rows(last_rows, sidx, tp_max_e1, tp_max_e2, max_e1, max_e2):
         note = "✓ EP2" if e2_act else ""
 
         row = [
+            sid,  # SignalID
             dt_from_ts(created_ts_i),
             prefix,
             dir_disp,
