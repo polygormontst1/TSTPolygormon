@@ -689,6 +689,12 @@ async def gs_append_profit(conn, gs: SheetsClient | None, sid: int, tp_index: in
     symbol = srow[3]
     side = srow[4]
     event_ts = int(time.time())
+    # --- BEST PROFIT (matches Telegram % with leverage) ---
+    best_lev = float(g1_lev)
+    best_from = "E1"
+    if g2_lev is not None and float(g2_lev) > best_lev:
+        best_lev = float(g2_lev)
+        best_from = "E2"                            
     row = [
         event_ts,
         sid,
@@ -702,8 +708,11 @@ async def gs_append_profit(conn, gs: SheetsClient | None, sid: int, tp_index: in
         round(g1_lev, 6),
         round(g2_spot, 6) if g2_spot is not None else "",
         round(g2_lev, 6) if g2_lev is not None else "",
-        note
+        note,
+        round(best_lev, 6),
+        best_from
     ]
+
     try:
         await asyncio.to_thread(gs.append_profit_event, row)
     except Exception as e:
@@ -1127,3 +1136,4 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
