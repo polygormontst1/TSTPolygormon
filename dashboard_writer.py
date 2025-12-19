@@ -191,7 +191,7 @@ def build_profit_maps(profit_headers, profit_rows):
     """
     idx = {h: i for i, h in enumerate(profit_headers)}
 
-    req = ["SignalID", "TPIndex", "ProfitLevPct_E1", "ProfitLevPct_E2"]
+    req = ["SignalID", "TPIndex", "ProfitLevPct_E1", "ProfitLevPct_E2", "ProfitSpotPct_E1", "ProfitSpotPct_E2"]
     if any(r not in idx for r in req):
         log(f"Profits headers missing some of {req}. Found={profit_headers}")
         return {}, {}, {}, {}
@@ -222,6 +222,24 @@ def build_profit_maps(profit_headers, profit_rows):
 
         p1 = safe_float(row[idx["ProfitLevPct_E1"]] if idx["ProfitLevPct_E1"] < len(row) else None)
         p2 = safe_float(row[idx["ProfitLevPct_E2"]] if idx["ProfitLevPct_E2"] < len(row) else None)
+
+s1 = safe_float(row[idx["ProfitSpotPct_E1"]] if idx["ProfitSpotPct_E1"] < len(row) else None)
+s2 = safe_float(row[idx["ProfitSpotPct_E2"]] if idx["ProfitSpotPct_E2"] < len(row) else None)
+
+LEVERAGE = 20.0
+# fallback: když je Lev prázdné → spočti z spot * 20
+if p1 is None and s1 is not None:
+    p1 = s1 * LEVERAGE
+if p2 is None and s2 is not None:
+    p2 = s2 * LEVERAGE
+
+# oprava: když je Lev očividně spot (typicky skoro stejné jako spot) → přepočti
+if p1 is not None and s1 is not None and abs(p1 - s1) < 1e-9:
+    p1 = s1 * LEVERAGE
+if p2 is not None and s2 is not None and abs(p2 - s2) < 1e-9:
+    p2 = s2 * LEVERAGE
+
+        
 
         if p1 is not None:
             tp_max_e1.setdefault(sid, {})
