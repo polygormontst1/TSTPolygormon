@@ -220,25 +220,11 @@ def build_profit_maps(profit_headers, profit_rows):
         except Exception:
             continue
             
-        p1 = safe_float(row[idx["ProfitLevPct_E1"]] if idx["ProfitLevPct_E1"] < len(row) else None)
-        p2 = safe_float(row[idx["ProfitLevPct_E2"]] if idx["ProfitLevPct_E2"] < len(row) else None)
-
-        s1 = safe_float(row[idx["ProfitSpotPct_E1"]] if idx["ProfitSpotPct_E1"] < len(row) else None)
-        s2 = safe_float(row[idx["ProfitSpotPct_E2"]] if idx["ProfitSpotPct_E2"] < len(row) else None)
-
         LEVERAGE = 20.0
-
-        # fallback: když je Lev prázdné -> spočti z spot * 20
-        if p1 is None and s1 is not None:
-            p1 = s1 * LEVERAGE
-        if p2 is None and s2 is not None:
-            p2 = s2 * LEVERAGE
-
-        # oprava: když je Lev očividně spot -> přepočti
-        if p1 is not None and s1 is not None and abs(p1 - s1) < 1e-9:
-            p1 = s1 * LEVERAGE
-        if p2 is not None and s2 is not None and abs(p2 - s2) < 1e-9:
-            p2 = s2 * LEVERAGE
+        p1 = safe_float(row[idx["ProfitSpotPct_E1"]] if idx["ProfitSpotPct_E1"] < len(row) else None)
+        p2 = safe_float(row[idx["ProfitSpotPct_E2"]] if idx["ProfitSpotPct_E2"] < len(row) else None)
+        p1 = (p1 * LEVERAGE) if p1 is not None else None
+        p2 = (p2 * LEVERAGE) if p2 is not None else None
 
         if p1 is not None:
             tp_max_e1.setdefault(sid, {})
@@ -257,12 +243,10 @@ def build_profit_maps(profit_headers, profit_rows):
             prevm = max_e2.get(sid)
             if prevm is None or p2 > prevm:
                 max_e2[sid] = p2
-
-
     return tp_max_e1, tp_max_e2, max_e1, max_e2
 
+def pick_last_signals(...):
 
-def pick_last_signals(signal_headers, signal_rows, n: int):
     idx = {h: i for i, h in enumerate(signal_headers)}
     if "CreatedTS" not in idx or "SignalID" not in idx:
         raise RuntimeError("Signals tab must have headers CreatedTS and SignalID.")
