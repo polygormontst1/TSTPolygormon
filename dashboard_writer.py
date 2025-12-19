@@ -186,25 +186,36 @@ def ensure_header(service):
 
 def build_profit_maps(profit_headers, profit_rows):
     """
-    Build per-signal per-TP maxima for E1 and E2 profits separately.
-    Ignore rows where Note contains "RETURN" (these are not TP hits).
+    Build per-signal per-TP maxima for E1 and E2 profits.
+    Prefer ProfitLevPct_* (already leveraged) if present.
+    Otherwise fallback to ProfitSpotPct_* * 20.
+    Ignore rows where Note contains "RETURN".
     """
     idx = {h: i for i, h in enumerate(profit_headers)}
 
-    req = ["SignalID", "TPIndex", "ProfitLevPct_E1", "ProfitLevPct_E2", "ProfitSpotPct_E1", "ProfitSpotPct_E2"]
-    if any(r not in idx for r in req):
-        log(f"Profits headers missing some of {req}. Found={profit_headers}")
-        return {}, {}, {}, {}
+    # must-have
+    for must in ["SignalID", "TPIndex"]:
+        if must not in idx:
+            log(f"Profits headers missing '{must}'. Found={profit_headers}")
+            return {}, {}, {}, {}
 
     note_i = idx.get("Note", None)
 
-    tp_max_e1 = {}  # {sid: {tp: max_e1}}
-    tp_max_e2 = {}  # {sid: {tp: max_e2}}
-    max_e1 = {}     # {sid: max_e1_any_tp}
-    max_e2 = {}     # {sid: max_e2_any_tp}
+    # optional columns
+    lev_e1_i = idx.get("ProfitLevPct_E1", None)
+    lev_e2_i = idx.get("ProfitLevPct_E2", None)
+    spot_e1_i = idx.get("ProfitSpotPct_E1", None)
+    spot_e2_i = idx.get("ProfitSpotPct_E2", None)
+
+    LEVERAGE = 20.0
+
+    tp_max_e1 = {}  # {sid: {tp: max_p1}}
+    tp_max_e2 = {}  # {sid: {tp: max_p2}}
+    max_e1 = {}     # {sid: max_p1_any_tp}
+    max_e2 = {}     # {sid: max_p2_any_tp}
 
     for row in profit_rows:
-        # filter non-TP events like RETURN_TO_EP1
+        # ignore non-TP events like RETURN_TO_EP1
         if note_i is not None and note_i < len(row):
             note = str(row[note_i]).strip().upper()
             if "RETURN" in note:
@@ -219,12 +230,24 @@ def build_profit_maps(profit_headers, profit_rows):
             tp = int(float(str(tp_raw).strip()))
         except Exception:
             continue
-            
-        LEVERAGE = 20.0
-        p1 = safe_float(row[idx["ProfitSpotPct_E1"]] if idx["ProfitSpotPct_E1"] < len(row) else None)
-        p2 = safe_float(row[idx["ProfitSpotPct_E2"]] if idx["ProfitSpotPct_E2"] < len(row) else None)
-        p1 = (p1 * LEVERAGE) if p1 is not None else None
-        p2 = (p2 * LEVERAGE) if p2 is not None else None
+
+        # ---- pick p1/p2: prefer leveraged cols, fallback to spot*20 ----
+        p1 = None
+        p2 = None
+
+        if lev_e1_i is not None and lev_e1_i < len(row):
+            p1 = safe_float(row[lev_e1_i])
+        if lev_e2_i is not None and lev_e2_i < len(row):
+            p2 = safe_float(row[lev_e2_i])
+
+        if p1 is None and spot_e1_i is not None and spot_e1_i < len(row):
+            s1 = safe_float(row[spot_e1_i])
+            p1 = (s1 * LEVERAGE) if s1 is not None else None
+
+        if p2 is None and spot_e2_i is not None and spot_e2_i < len(row):
+            s2 = safe_float(row[spot_e2_i])
+            p2 = (s2 * LEVERAGE) if s2 is not None else None
+        # --------------------------------------------------------------
 
         if p1 is not None:
             tp_max_e1.setdefault(sid, {})
@@ -243,7 +266,9 @@ def build_profit_maps(profit_headers, profit_rows):
             prevm = max_e2.get(sid)
             if prevm is None or p2 > prevm:
                 max_e2[sid] = p2
+
     return tp_max_e1, tp_max_e2, max_e1, max_e2
+
 
 def pick_last_signals(...):
 
