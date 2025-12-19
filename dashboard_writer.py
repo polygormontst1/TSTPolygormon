@@ -270,8 +270,7 @@ def build_profit_maps(profit_headers, profit_rows):
     return tp_max_e1, tp_max_e2, max_e1, max_e2
 
 
-def pick_last_signals(...):
-
+def pick_last_signals(signal_headers, signal_rows, n: int):
     idx = {h: i for i, h in enumerate(signal_headers)}
     if "CreatedTS" not in idx or "SignalID" not in idx:
         raise RuntimeError("Signals tab must have headers CreatedTS and SignalID.")
