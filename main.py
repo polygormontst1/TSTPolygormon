@@ -705,7 +705,7 @@ async def gs_append_profit(conn, gs: SheetsClient | None, sid: int, tp_index: in
             return ""
 
     # výběr nejlepšího profitu (porovnáváme původní hodnoty, tj. "větší je lepší")
-    best_lev = float(g1_lev) if g1_lev is not None else 0.0
+    best_lev = float(g1_lev) if (g1_lev is not None and g1_lev != "") else 0.0
     best_from = "E1"
     if g2_lev is not None and float(g2_lev) > best_lev:
         best_lev = float(g2_lev)
@@ -1159,5 +1159,6 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
