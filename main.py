@@ -416,7 +416,8 @@ PROFITS_HEADERS = [
     "Entry1Price","Entry2Price",
     "ProfitSpot1","ProfitLev1",
     "ProfitSpot2","ProfitLev2",
-    "Note"
+    "Note",
+    "ProfitLevBest","BestFrom"
 ]
 
 def _b64_to_json_dict(b64: str) -> dict:
@@ -690,28 +691,50 @@ async def gs_append_profit(conn, gs: SheetsClient | None, sid: int, tp_index: in
     side = srow[4]
     event_ts = int(time.time())
     # --- BEST PROFIT (matches Telegram % with leverage) ---
-    best_lev = float(g1_lev)
+    def _pct_to_fraction(x):
+        """
+        Bot interně často pracuje s "procenty" jako číslem (např. 1.52 = 1.52%),
+        ale Google Sheets sloupec ve formátu % očekává zlomek (0.0152 = 1.52%).
+        Proto dělíme /100.
+        """
+        if x is None or x == "":
+            return ""
+        try:
+            return round(float(x) / 100.0, 8)
+        except Exception:
+            return ""
+
+    # výběr nejlepšího profitu (porovnáváme původní hodnoty, tj. "větší je lepší")
+    best_lev = float(g1_lev) if g1_lev is not None else 0.0
     best_from = "E1"
     if g2_lev is not None and float(g2_lev) > best_lev:
         best_lev = float(g2_lev)
-        best_from = "E2"                            
+        best_from = "E2"
+
     row = [
-        event_ts,
-        sid,
-        symbol,
-        side,
-        tp_index,
-        tp_price,
-        entry1_price if entry1_price is not None else "",
-        entry2_price if entry2_price is not None else "",
-        round(g1_spot, 6),
-        round(g1_lev, 6),
-        round(g2_spot, 6) if g2_spot is not None else "",
-        round(g2_lev, 6) if g2_lev is not None else "",
-        note,
-        round(best_lev, 6),
-        best_from
+        event_ts,  # A EventTS
+        sid,       # B SignalID
+        symbol,    # C Symbol
+        side,      # D Side
+        tp_index,  # E TPIndex
+        tp_price,  # F TPPrice
+
+        entry1_price if entry1_price is not None else "",  # G Entry1Price
+
+        _pct_to_fraction(g1_spot),  # H ProfitSpotPc1  (do % jako zlomek)
+        _pct_to_fraction(g1_lev),   # I ProfitLevPc1   (do % jako zlomek)
+
+        entry2_price if entry2_price is not None else "",  # J Entry2Price
+
+        _pct_to_fraction(g2_spot),  # K ProfitSpotPc2  (do % jako zlomek)
+        _pct_to_fraction(g2_lev),   # L ProfitLevPc2   (do % jako zlomek)
+
+        note,                       # M Note
+        _pct_to_fraction(best_lev), # N ProfitLevBest  (do % jako zlomek)
+        best_from                   # O BestFrom
     ]
+
+
 
     try:
         await asyncio.to_thread(gs.append_profit_event, row)
@@ -1136,4 +1159,5 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
