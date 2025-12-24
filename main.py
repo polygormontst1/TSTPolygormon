@@ -919,45 +919,52 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             avg_reached_sent = 1
 
                 # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
-                if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
-                    tp1 = float(tps[0])
-                    tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
-                    if tp1_is_hit_now:
-                           entry2_price = e2_activated_price if e2_activated_price else None
-                        if entry2_price:
-                            # počítáme VŽDY obě Entry (bez výjimek)
-                            g1_spot = pct_from_entry(tp1, entry1_price, side)
-                            g1_lev = g1_spot * LEVERAGE
+if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
+    tp1 = float(tps[0])
+    tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
 
-                            g2_spot = pct_from_entry(tp1, entry2_price, side)
-                            g2_lev = g2_spot * LEVERAGE
+    if tp1_is_hit_now:
+        entry2_price = e2_activated_price if e2_activated_price else None
 
-                            profit_line = (
-                                f"Zisk: {g1_spot:.2f}% ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
-                                f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
-                            )
+        if entry2_price:
+            # VŽDY počítáme obě Entry (bez výjimek)
+            g1_spot = pct_from_entry(tp1, entry1_price, side)
+            g1_lev = g1_spot * LEVERAGE
 
-                            # ZAPISUJEME do Profits event pro TP1 znovu, tentokrát s oběma entry,
-                            # aby dashboard mohl vzít MAX (a měl data pro EP1+EP2)
-                            await gs_append_profit(
-                                conn, gs, sid,
-                                tp_index=1,
-                                tp_price=tp1,
-                                entry1_price=entry1_price,
-                                entry2_price=entry2_price,
-                                g1_spot=g1_spot, g1_lev=g1_lev,
-                                g2_spot=g2_spot, g2_lev=g2_lev,
-                                note="TP1_REHIT_AFTER_E2"
-                            )
+            g2_spot = pct_from_entry(tp1, entry2_price, side)
+            g2_lev = g2_spot * LEVERAGE
 
-                            await post_target(bot,
-                                f"🎯 {symbol} – TP1 HIT (po aktivaci 2. Entry)\n"
-                                f"Směr: {side}\n"
-                                f"Entry1: {fmt(entry1_price)}\n"
-                                f"Entry2: {fmt(entry2_price)}\n"
-                                f"TP1: {fmt(tp1)}\n"
-                                f"{profit_line}"
-                            )
+            # zapisujeme znovu TP1 event, tentokrát s oběma entry
+            await gs_append_profit(
+                conn, gs, sid,
+                tp_index=1,
+                tp_price=tp1,
+                entry1_price=entry1_price,
+                entry2_price=entry2_price,
+                g1_spot=g1_spot, g1_lev=g1_lev,
+                g2_spot=g2_spot, g2_lev=g2_lev,
+                note="TP1_REHIT_AFTER_E2"
+            )
+
+            await post_target(
+                bot,
+                f"🎯 {symbol} – TP1 HIT (po aktivaci 2. Entry)\n"
+                f"Směr: {side}\n"
+                f"Entry1: {fmt(entry1_price)}\n"
+                f"Entry2: {fmt(entry2_price)}\n"
+                f"TP1: {fmt(tp1)}\n"
+                f"Zisk: {g1_spot:.2f}% čistého trhu ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
+                f"      {g2_spot:.2f}% čistého trhu ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
+            )
+
+            conn.execute(
+                "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
+                (sid,)
+            )
+
+            conn.commit()
+            tp1_rehit_sent = 1
+
 
 
                 # 4) Normal TP hits
@@ -1174,6 +1181,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
