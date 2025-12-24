@@ -863,6 +863,14 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                         entry1_price = price
                 else:
                     entry1_price = None
+                # Entry1 reference for PROFIT (always from your written Entry1 zone)
+                entry1_ref = None
+                if e1l is not None and e1h is not None:
+                    entry1_ref = (float(e1l) + float(e1h)) / 2.0
+                elif entry1_price:
+                    entry1_ref = float(entry1_price)
+                    
+                    
 
                 # Current performance from entry1
                 perf_from_e1 = 0.0
@@ -922,47 +930,61 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
                     tp1 = float(tps[0])
                     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
-
                     if tp1_is_hit_now:
                         entry2_price = e2_activated_price if e2_activated_price else None
 
-                        if entry1_price and entry2_price:
-                            # VŽDY počítáme obě Entry (bez výjimek)
-                            g1_spot = pct_from_entry(tp1, entry1_price, side)
-                            g1_lev = g1_spot * LEVERAGE
+                        if entry1_ref and entry2_price:
+                            # guard: TP must be on profit side of entry1_ref
+                            if (side == "LONG" and tp1 <= entry1_ref) or (side == "SHORT" and tp1 >= entry1_ref):
+                                conn.execute(
+                                    "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
+                                    (sid,)
+                                )
+                                conn.commit()
+                                tp1_rehit_sent = 1
+                            else:
+                                g1_spot = pct_from_entry(tp1, entry1_ref, side)
+                                g1_lev = g1_spot * LEVERAGE
 
-                            g2_spot = pct_from_entry(tp1, entry2_price, side)
-                            g2_lev = g2_spot * LEVERAGE
+                                g2_spot = pct_from_entry(tp1, entry2_price, side)
+                                g2_lev = g2_spot * LEVERAGE
 
-                            # Zapíšeme TP1 znovu i do Profits (kvůli dashboard MAX = EP1+EP2)
-                            await gs_append_profit(
-                                conn, gs, sid,
-                                tp_index=1,
-                                tp_price=tp1,
-                                entry1_price=entry1_price,
-                                entry2_price=entry2_price,
-                                g1_spot=g1_spot, g1_lev=g1_lev,
-                                g2_spot=g2_spot, g2_lev=g2_lev,
-                                note="TP1_REHIT_AFTER_E2"
+                                # guard: never post/write negative/zero profit
+                                if g1_spot > 0 and g2_spot > 0:
+                                    await gs_append_profit(
+                                        conn, gs, sid,
+                                        tp_index=1,
+                                        tp_price=tp1,
+                                        entry1_price=entry1_ref,
+                                        entry2_price=entry2_price,
+                                        g1_spot=g1_spot, g1_lev=g1_lev,
+                                        g2_spot=g2_spot, g2_lev=g2_lev,
+                                        note="TP1_REHIT_AFTER_E2"
+                                    )
+
+                                    await post_target(bot,
+                                        f"🎯 {symbol} – TP1 HIT (po aktivaci 2. Entry)\n"
+                                        f"Směr: {side}\n"
+                                        f"Entry1: {fmt(entry1_ref)}\n"
+                                        f"Entry2: {fmt(entry2_price)}\n"
+                                        f"TP1: {fmt(tp1)}\n"
+                                        f"Zisk: {g1_spot:.2f}% ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
+                                        f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
+                                    )
+
+                                conn.execute(
+                                    "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
+                                    (sid,)
+                                )
+                                conn.commit()
+                                tp1_rehit_sent = 1
+                        else:
+                            conn.execute(
+                                "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
+                                (sid,)
                             )
-
-                            await post_target(
-                                bot,
-                                f"🎯 {symbol} – TP1 HIT (po aktivaci 2. Entry)\n"
-                                f"Směr: {side}\n"
-                                f"Entry1: {fmt(entry1_price)}\n"
-                                f"Entry2: {fmt(entry2_price)}\n"
-                                f"TP1: {fmt(tp1)}\n"
-                                f"Zisk: {g1_spot:.2f}% ({g1_lev:.2f}% s pákou {LEVERAGE:g}x) z 1. Entry\n"
-                                f"      {g2_spot:.2f}% ({g2_lev:.2f}% s pákou {LEVERAGE:g}x) z 2. Entry"
-                            )
-
-                        conn.execute(
-                            "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
-                            (sid,)
-                        )
-                        conn.commit()
-                        tp1_rehit_sent = 1
+                            conn.commit()
+                            tp1_rehit_sent = 1
 
 
 
@@ -972,7 +994,16 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
 
                     while tp_hits < len(tps):
                         tp = float(tps[tp_hits])
+
+                        # guard: TP must be on profit side of entry1_ref (prevents negative "TP hit")
+                        if entry1_ref and ((side == "LONG" and tp <= entry1_ref) or (side == "SHORT" and tp >= entry1_ref)):
+                            tp_hits += 1
+                            conn.execute("UPDATE signals SET tp_hits=? WHERE id=?", (tp_hits, sid))
+                            conn.commit()
+                            continue
+
                         is_hit = (price >= tp) if side == "LONG" else (price <= tp)
+
                         if not is_hit:
                             break
 
@@ -985,8 +1016,13 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             "Status": "ENTRY2" if e2_activated else "ACTIVE"
                         })
 
-                        g1_spot = pct_from_entry(tp, entry1_price, side)
+                        g1_spot = pct_from_entry(tp, entry1_ref if entry1_ref else entry1_price, side)
                         g1_lev = g1_spot * LEVERAGE
+
+                        # guard: never post/write negative/zero profit
+                        if g1_spot <= 0:
+                            continue
+
 
                         g2_spot = g2_lev = None
                         if entry2_price is not None and entry2_price != 0:
@@ -1180,6 +1216,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
