@@ -1171,32 +1171,43 @@ async def main_async():
 
                     # MARKET => activate immediately
                     if s["mode"] == "MARKET":
-                        price_now = await get_price(s["symbol"])
+                        price_now = None
+
+                        # retry price few times (worker sometimes 502)
+                        for _ in range(5):
+                            price_now = await get_price(s["symbol"])
+                            if price_now is not None:
+                                break
+                            await asyncio.sleep(1)
+
+                        # hard fallback: use YOUR written Entry1 mid (so we still activate + report)
                         if price_now is None:
-                            log(f"MARKET activate: price None for {s['symbol']} (skip)")
-                        else:
-                            now_ts = int(time.time())
-                            conn.execute(
-                                "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
-                                (now_ts, price_now, sid)
-                            )
-                            conn.commit()
+                            price_now = (float(s["entry1_low"]) + float(s["entry1_high"])) / 2.0
+                            log(f"MARKET activate: price feed None for {s['symbol']} -> fallback to Entry1 mid={price_now}")
 
-                            await gs_update_signal_fields(conn, gs, sid, {
-                                "Status": "ACTIVE",
-                                "Activated": 1,
-                                "ActivatedTS": now_ts,
-                                "ActivatedPrice": price_now
-                            })
+                        now_ts = int(time.time())
+                        conn.execute(
+                            "UPDATE signals SET activated=1, activated_ts=?, activated_price=? WHERE id=?",
+                            (now_ts, price_now, sid)
+                        )
+                        conn.commit()
 
-                            await post_target(bot,
-                                "✅ Signál aktivován (MARKET)\n"
-                                f"{s['symbol']} ({s['side']})\n"
-                                f"Vstup (Entry1): {fmt(price_now)}\n"
-                                f"{('Entry2: ' + fmt(s['entry2_low']) + ' - ' + fmt(s['entry2_high'])) if (s['entry2_low'] is not None and s['entry2_high'] is not None) else 'Entry2: -'}\n"
-                                f"TPs: {len(s['tps'])}"
-                            )
-                            log(f"MARKET activated sid={sid} {s['symbol']} price={price_now}")
+                        await gs_update_signal_fields(conn, gs, sid, {
+                            "Status": "ACTIVE",
+                            "Activated": 1,
+                            "ActivatedTS": now_ts,
+                            "ActivatedPrice": price_now
+                        })
+
+                        await post_target(bot,
+                            "✅ Signál aktivován (MARKET)\n"
+                            f"{s['symbol']} ({s['side']})\n"
+                            f"Vstup (Entry1): {fmt(price_now)}\n"
+                            f"{('Entry2: ' + fmt(s['entry2_low']) + ' - ' + fmt(s['entry2_high'])) if (s['entry2_low'] is not None and s['entry2_high'] is not None) else 'Entry2: -'}\n"
+                            f"TPs: {len(s['tps'])}"
+                        )
+                        log(f"MARKET activated sid={sid} {s['symbol']} price={price_now}")
+
 
                 await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -1216,6 +1227,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
