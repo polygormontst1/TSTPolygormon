@@ -918,7 +918,7 @@ async def monitor_prices(bot: Bot, conn, gs: SheetsClient | None, stop_event: as
                             conn.commit()
                             avg_reached_sent = 1
 
-                # 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
+# 3) TP1 re-hit after Entry2 activation (ONLY ONCE)
 if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and len(tps) >= 1:
     tp1 = float(tps[0])
     tp1_is_hit_now = (price >= tp1) if side == "LONG" else (price <= tp1)
@@ -961,9 +961,9 @@ if activated and e2_activated and (tp_hits >= 1) and (tp1_rehit_sent == 0) and l
                 "UPDATE signals SET tp1_rehit_after_entry2_sent=1 WHERE id=?",
                 (sid,)
             )
-
             conn.commit()
             tp1_rehit_sent = 1
+
 
 
 
@@ -1181,6 +1181,7 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
 
 
 
